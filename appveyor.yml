@@ -18,11 +18,21 @@ build_script:
 after_build:
   - "copy config.example.yaml dist\\"
   - "copy create_watch_template.py dist\\"
-  - "copy *.md dist\\"
-  - "python -c \"import shutil,glob; [shutil.copy(f,'dist/') for f in glob.glob('*.md')+glob.glob('*.txt')]\""
+  - "python -c \"import shutil,pathlib; [shutil.copy(str(f),'dist/'+{'使用说明书':'UserManual','部署教程':'DeployGuide'}.get(f.stem,f.stem)+f.suffix) for f in pathlib.Path('.').glob('*.md') if f.stem!='README']\""
+  - "copy README.md dist\\"
 
 artifacts:
-  - path: dist\*
-    name: CrawlerTool
+  - path: dist\CrawlerTool.exe
+    name: CrawlerTool.exe
+  - path: dist\config.example.yaml
+    name: config.example.yaml
+  - path: dist\README.md
+    name: README.md
+  - path: dist\UserManual.md
+    name: UserManual.md
+  - path: dist\DeployGuide.md
+    name: DeployGuide.md
+  - path: dist\create_watch_template.py
+    name: create_watch_template.py
 
 test: off
