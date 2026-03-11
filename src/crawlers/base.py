@@ -3,6 +3,10 @@
 """
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .browser_manager import BrowserManager
 
 
 @dataclass
@@ -16,10 +20,10 @@ class CrawlResult:
 
 
 class BaseCrawler(ABC):
-    """同城数据爬虫基类"""
+    """同城数据爬虫基类 — Playwright network-intercept approach"""
 
-    def __init__(self, interval_seconds: int = 30):
-        self.interval_seconds = interval_seconds  # 采集间隔，稳定为主
+    def __init__(self, browser_manager: "BrowserManager | None" = None):
+        self.bm = browser_manager
 
     @property
     @abstractmethod

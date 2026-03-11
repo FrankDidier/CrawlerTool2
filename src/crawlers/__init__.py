@@ -1,8 +1,8 @@
 """
-爬虫模块 - 4 平台同城数据采集
-各平台独立进程，互不干扰
+爬虫模块 - 4 平台同城数据采集 (Playwright browser scraping)
 """
 from .base import BaseCrawler, CrawlResult
+from .browser_manager import BrowserManager
 from .manager import CrawlerManager
 
-__all__ = ["BaseCrawler", "CrawlResult", "CrawlerManager"]
+__all__ = ["BaseCrawler", "CrawlResult", "BrowserManager", "CrawlerManager"]

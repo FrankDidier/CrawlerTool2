@@ -483,11 +483,35 @@ class MainApp(tk.Frame):
     # ── 设置 ──
 
     def _open_settings(self):
-        """综合设置窗口：大模型 API + 钉钉 + 微信"""
+        """综合设置窗口：平台登录 + 大模型 API + 钉钉 + 微信"""
         win = tk.Toplevel(self)
         win.title("设置")
-        win.geometry("480x420")
+        win.geometry("500x580")
         cfg = load_config()
+
+        # --- 平台登录 ---
+        from .crawlers.browser_manager import BrowserManager
+        bm = BrowserManager(DATA_DIR)
+
+        lf0 = ttk.LabelFrame(win, text="平台登录（采集前需先登录）")
+        lf0.pack(fill="x", padx=10, pady=8)
+        ttk.Label(lf0, text="点击「登录」打开浏览器，手动登录后关闭浏览器窗口即可。",
+                  foreground="gray").pack(anchor="w", padx=5, pady=2)
+
+        self._login_status_labels = {}
+        for platform in CRAWLERS:
+            row = ttk.Frame(lf0)
+            row.pack(fill="x", padx=5, pady=2)
+            ttk.Label(row, text=platform, width=10).pack(side="left")
+            has = bm.has_cookies(platform)
+            lbl = ttk.Label(row, text="已登录" if has else "未登录",
+                            foreground="green" if has else "red")
+            lbl.pack(side="left", padx=10)
+            self._login_status_labels[platform] = lbl
+
+            def _make_cmd(p=platform, l=lbl, w=win):
+                return lambda: self._login_platform(p, l, w)
+            ttk.Button(row, text="登录", command=_make_cmd()).pack(side="right")
 
         # --- 大模型 ---
         lf1 = ttk.LabelFrame(win, text="大模型 API（语义判断）")
@@ -533,7 +557,38 @@ class MainApp(tk.Frame):
             messagebox.showinfo("成功", "设置已保存")
             win.destroy()
 
-        ttk.Button(win, text="保存", command=do_save).pack(pady=10)
+        ttk.Button(win, text="保存设置", command=do_save).pack(pady=10)
+
+    def _login_platform(self, platform, status_label, parent_win):
+        """Open a visible browser for the user to log in to *platform*."""
+        messagebox.showinfo(
+            "登录提示",
+            f"即将打开 {platform} 登录页面。\n\n"
+            "请在浏览器中完成登录，\n"
+            "登录成功后关闭浏览器窗口。",
+            parent=parent_win,
+        )
+        status_label.config(text="登录中...", foreground="orange")
+
+        def do():
+            async def _login():
+                from .crawlers.browser_manager import BrowserManager
+                bm = BrowserManager(DATA_DIR)
+                return await bm.login_interactive(platform)
+            ok = run_async(_login())
+
+            def update():
+                if ok:
+                    status_label.config(text="已登录", foreground="green")
+                    messagebox.showinfo("成功", f"{platform} 登录成功！cookies 已保存。",
+                                        parent=parent_win)
+                else:
+                    status_label.config(text="登录失败", foreground="red")
+                    messagebox.showwarning("失败", f"{platform} 登录失败，请重试。",
+                                           parent=parent_win)
+            self.after(0, update)
+
+        threading.Thread(target=do, daemon=True).start()
 
     # ── 采集 ──
 
@@ -542,10 +597,21 @@ class MainApp(tk.Frame):
         if not platforms:
             messagebox.showwarning("提示", "请至少选择一个平台")
             return
-        self.crawler_manager = CrawlerManager(DB_PATH, platforms)
+
+        from .crawlers.browser_manager import BrowserManager
+        bm_check = BrowserManager(DATA_DIR)
+        no_cookies = [p for p in platforms if not bm_check.has_cookies(p)]
+        if no_cookies:
+            msg = (f"以下平台尚未登录：{', '.join(no_cookies)}\n\n"
+                   "建议先在「设置」中登录各平台，否则可能无法获取数据。\n\n"
+                   "是否继续？")
+            if not messagebox.askyesno("提示", msg):
+                return
+
+        self.crawler_manager = CrawlerManager(DB_PATH, platforms, DATA_DIR)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.lbl_status.config(text="采集中...")
+        self.lbl_status.config(text="采集中（首次启动需安装浏览器，请稍候）...")
 
         def run():
             loop = asyncio.new_event_loop()
