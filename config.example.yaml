@@ -1,0 +1,21 @@
+# 爬虫小工具配置文件
+# 复制为 config.yaml 并填写实际值
+
+# 应用
+app:
+  name: 爬虫小工具
+  data_dir: ./data  # 数据存储目录
+
+# 大模型 API (硅基流动 / OpenAI 兼容)
+llm:
+  base_url: https://api.siliconflow.cn/v1  # 硅基流动
+  api_key: ""  # 员工自行填入
+  model: ""    # 如 Qwen/Qwen2.5-7B-Instruct
+
+# 钉钉机器人
+dingtalk:
+  webhook_url: ""  # 钉钉群机器人 webhook
+
+# 企业微信 (用于推送至微信)
+wechat:
+  webhook_url: ""  # 企业微信机器人 webhook
