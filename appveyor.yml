@@ -12,13 +12,13 @@ install:
   - "python -m pip install pyinstaller"
 
 build_script:
-  - "pyinstaller --onefile --windowed --name CrawlerTool --add-data config.example.yaml;. --add-data 使用说明书.md;. --add-data 部署教程.md;. main.py"
+  - "pyinstaller --onefile --windowed --name CrawlerTool --add-data config.example.yaml;. main.py"
 
 after_build:
   - "copy config.example.yaml dist\\"
-  - "copy 使用说明书.md dist\\"
-  - "copy 部署教程.md dist\\"
   - "copy create_watch_template.py dist\\"
+  - "copy *.md dist\\"
+  - "python -c \"import shutil,glob; [shutil.copy(f,'dist/') for f in glob.glob('*.md')+glob.glob('*.txt')]\""
 
 artifacts:
   - path: dist\*
