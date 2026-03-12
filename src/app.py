@@ -564,6 +564,7 @@ class MainApp(tk.Frame):
         messagebox.showinfo(
             "登录提示",
             f"即将打开 {platform} 登录页面。\n\n"
+            "将自动使用系统已安装的 Chrome 或 Edge 浏览器。\n"
             "请在浏览器中完成登录，\n"
             "登录成功后关闭浏览器窗口。",
             parent=parent_win,
@@ -571,11 +572,18 @@ class MainApp(tk.Frame):
         status_label.config(text="登录中...", foreground="orange")
 
         def do():
+            error_msg = ""
+
             async def _login():
                 from .crawlers.browser_manager import BrowserManager
                 bm = BrowserManager(DATA_DIR)
                 return await bm.login_interactive(platform)
-            ok = run_async(_login())
+
+            try:
+                ok = run_async(_login())
+            except Exception as exc:
+                ok = False
+                error_msg = str(exc)
 
             def update():
                 if ok:
@@ -584,8 +592,11 @@ class MainApp(tk.Frame):
                                         parent=parent_win)
                 else:
                     status_label.config(text="登录失败", foreground="red")
-                    messagebox.showwarning("失败", f"{platform} 登录失败，请重试。",
-                                           parent=parent_win)
+                    msg = f"{platform} 登录失败。\n\n"
+                    if error_msg:
+                        msg += f"错误信息:\n{error_msg}\n\n"
+                    msg += "请确保系统已安装 Google Chrome 或 Microsoft Edge 浏览器。"
+                    messagebox.showwarning("失败", msg, parent=parent_win)
             self.after(0, update)
 
         threading.Thread(target=do, daemon=True).start()

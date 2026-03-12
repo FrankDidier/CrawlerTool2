@@ -3,11 +3,15 @@ Playwright browser management for real web scraping.
 
 Handles browser lifecycle, cookie persistence, and interactive login.
 Each platform gets its own BrowserContext with saved cookies.
+
+Browser resolution order:
+  1. System Google Chrome  (channel="chrome")
+  2. System Microsoft Edge (channel="msedge")
+  3. Playwright bundled Chromium (requires `playwright install chromium`)
 """
 import json
 import asyncio
 import logging
-import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -25,23 +29,44 @@ UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
 
-async def install_playwright_browsers():
-    """Install Playwright Chromium browser binaries if missing."""
-    import subprocess
+_CHANNELS = [
+    ("chrome", "Google Chrome"),
+    ("msedge", "Microsoft Edge"),
+]
 
-    def _install():
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to install Playwright browsers:\n{result.stderr}"
+
+async def _launch_with_fallback(pw, *, headless: bool):
+    """Try system Chrome → Edge → Playwright Chromium.  Returns a Browser."""
+    errors: list[str] = []
+
+    for channel, label in _CHANNELS:
+        try:
+            browser = await pw.chromium.launch(
+                headless=headless, channel=channel, args=LAUNCH_ARGS,
             )
+            logger.info("Launched %s (channel=%s, headless=%s)", label, channel, headless)
+            return browser
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            logger.debug("Cannot launch %s: %s", label, exc)
 
-    await asyncio.to_thread(_install)
-    logger.info("Playwright Chromium installed successfully")
+    try:
+        browser = await pw.chromium.launch(headless=headless, args=LAUNCH_ARGS)
+        logger.info("Launched Playwright bundled Chromium (headless=%s)", headless)
+        return browser
+    except Exception as exc:
+        errors.append(f"Playwright Chromium: {exc}")
+
+    raise RuntimeError(
+        "无法启动浏览器。请确保系统已安装 Google Chrome 或 Microsoft Edge。\n"
+        "详细错误:\n" + "\n".join(errors)
+    )
 
 
 class BrowserManager:
@@ -66,31 +91,14 @@ class BrowserManager:
     # ── Browser lifecycle ──
 
     async def start(self):
-        """Initialize Playwright and launch headless Chromium."""
+        """Initialize Playwright and launch headless browser (Chrome → Edge → Chromium)."""
         from playwright.async_api import async_playwright
 
         if self._pw is None:
             self._pw = await async_playwright().start()
 
         if self._browser is None or not self._browser.is_connected():
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-            try:
-                self._browser = await self._pw.chromium.launch(
-                    headless=True, args=launch_args,
-                )
-            except Exception as exc:
-                if "Executable doesn't exist" in str(exc):
-                    logger.info("Chromium not found — installing via Playwright …")
-                    await install_playwright_browsers()
-                    self._browser = await self._pw.chromium.launch(
-                        headless=True, args=launch_args,
-                    )
-                else:
-                    raise
+            self._browser = await _launch_with_fallback(self._pw, headless=True)
 
     async def get_page(self, platform: str):
         """Get or create a page for *platform*, reusing across cycles."""
@@ -175,6 +183,7 @@ class BrowserManager:
     async def login_interactive(self, platform: str) -> bool:
         """
         Open a *visible* browser for the user to log in manually.
+        Uses system Chrome/Edge so no extra download is needed.
         Cookies are captured periodically while the browser is open.
         The user closes the browser window when done.
         Returns True if cookies were obtained.
@@ -188,10 +197,7 @@ class BrowserManager:
         pw = await async_playwright().start()
         saved_cookies: list = []
         try:
-            browser = await pw.chromium.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
+            browser = await _launch_with_fallback(pw, headless=False)
             context = await browser.new_context(
                 user_agent=UA,
                 viewport={"width": 1280, "height": 720},
