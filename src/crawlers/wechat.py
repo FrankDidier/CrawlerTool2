@@ -1,29 +1,25 @@
 """
-微信视频号同城爬虫 — Playwright network-intercept scraping
+微信视频号爬虫 — Playwright SSR extraction + network interception
 
-Navigates to https://channels.weixin.qq.com, intercepts feed API
-responses, and parses content items.
+Data collection strategy:
+  1. Navigate to channels.weixin.qq.com with saved cookies
+  2. Extract SSR/initial state data from page HTML
+  3. Intercept feed API responses during scroll
+  4. Combine and deduplicate
 
-NOTE: WeChat Channels has the most restrictive web access; this
-crawler may return fewer results than other platforms.  Login via
-QR code is typically required.
+NOTE: WeChat Channels has the most restrictive web access and typically
+requires QR-code login. This crawler may return fewer results.
 """
 import asyncio
+import json
 import logging
 from datetime import datetime
+
 from .base import BaseCrawler, CrawlResult
 
 logger = logging.getLogger(__name__)
 
 CHANNELS_URL = "https://channels.weixin.qq.com"
-API_PATTERNS = (
-    "cgi-bin/mmfinderassistant",
-    "/channels/",
-    "finder",
-    "feedlist",
-    "finderFeed",
-    "mmfinder",
-)
 
 
 class WechatCrawler(BaseCrawler):
@@ -41,37 +37,63 @@ class WechatCrawler(BaseCrawler):
         captured: list[dict] = []
 
         async def on_response(response):
-            if not any(p in response.url for p in API_PATTERNS):
-                return
+            url = response.url
             if response.status != 200:
+                return
+            hit = (
+                "cgi-bin/mmfinderassistant" in url
+                or "finder" in url
+                or "feedlist" in url
+                or "/channels/" in url
+                or "mmfinder" in url
+            )
+            if not hit:
                 return
             try:
                 ct = response.headers.get("content-type", "")
                 if "json" in ct or "javascript" in ct:
                     body = await response.json()
                     captured.append(body)
+                    logger.debug("[微信视频号] API captured: %s", url[:150])
             except Exception:
                 pass
 
         page.on("response", on_response)
+        ssr_items: list[dict] = []
+
         try:
-            await page.goto(CHANNELS_URL, wait_until="networkidle", timeout=30_000)
+            await page.goto(
+                CHANNELS_URL, wait_until="domcontentloaded", timeout=30_000,
+            )
+            await asyncio.sleep(4)
 
-            # Try to navigate to local feed
-            try:
-                local_tab = page.locator("text=同城").or_(page.locator("text=附近")).first
-                if await local_tab.is_visible(timeout=3000):
-                    await local_tab.click()
-                    await asyncio.sleep(3)
-            except Exception:
-                pass
+            title = await page.title()
+            logger.info("[微信视频号] Page: '%s' @ %s", title, page.url)
 
-            for _ in range(3):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            ssr_items = await self._extract_ssr(page)
+            if ssr_items:
+                logger.info("[微信视频号] SSR: found %d items", len(ssr_items))
+
+            for label in ("同城", "附近", "本地"):
+                try:
+                    tab = page.locator(f"text={label}").first
+                    if await tab.is_visible(timeout=2000):
+                        await tab.click()
+                        await asyncio.sleep(3)
+                        logger.info("[微信视频号] Clicked '%s' tab", label)
+                        break
+                except Exception:
+                    continue
+
+            for _ in range(5):
+                await page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)"
+                )
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
+
         except Exception as exc:
-            logger.warning("[微信视频号] Page load: %s", exc)
+            logger.warning("[微信视频号] Page error: %s", exc)
         finally:
             page.remove_listener("response", on_response)
 
@@ -79,16 +101,85 @@ class WechatCrawler(BaseCrawler):
 
         results: list[CrawlResult] = []
         seen: set[str] = set()
+
+        for item in ssr_items:
+            r = self._parse_item(item, seen)
+            if r:
+                results.append(r)
+
         for body in captured:
             results.extend(self._parse_response(body, seen))
-        logger.info("[微信视频号] %d items from %d API responses", len(results), len(captured))
+
+        logger.info(
+            "[微信视频号] Total: %d items (SSR=%d, API captures=%d)",
+            len(results), len(ssr_items), len(captured),
+        )
         return results
 
-    # ── parsing ──
+    # ── SSR extraction ──
+
+    async def _extract_ssr(self, page) -> list[dict]:
+        try:
+            raw = await page.evaluate("""() => {
+                if (window.__INITIAL_DATA__)
+                    return JSON.stringify(window.__INITIAL_DATA__);
+                if (window.__NEXT_DATA__)
+                    return JSON.stringify(window.__NEXT_DATA__);
+                const scripts = document.querySelectorAll(
+                    'script[type="application/json"]'
+                );
+                for (const s of scripts) {
+                    if (s.textContent && s.textContent.length > 200)
+                        return s.textContent;
+                }
+                return null;
+            }""")
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return self._dig_feed_items(data)
+        except Exception as exc:
+            logger.debug("[微信视频号] SSR error: %s", exc)
+            return []
+
+    def _dig_feed_items(self, obj, depth=0) -> list[dict]:
+        if depth > 6:
+            return []
+        if isinstance(obj, list):
+            valid = [
+                i for i in obj
+                if isinstance(i, dict) and (
+                    "objectId" in i or "feedId" in i or "id" in i
+                ) and (
+                    "nickname" in i or "description" in i
+                    or "object" in i or "author" in i
+                )
+            ]
+            if valid:
+                return valid
+            out: list[dict] = []
+            for item in obj:
+                if isinstance(item, dict):
+                    out.extend(self._dig_feed_items(item, depth + 1))
+            return out
+        if isinstance(obj, dict):
+            for key in ("feedList", "objectList", "list", "data", "items"):
+                val = obj.get(key)
+                if isinstance(val, list) and val:
+                    found = self._dig_feed_items(val, depth + 1)
+                    if found:
+                        return found
+            out = []
+            for val in obj.values():
+                if isinstance(val, (dict, list)):
+                    out.extend(self._dig_feed_items(val, depth + 1))
+            return out
+        return []
+
+    # ── API response parsing ──
 
     def _parse_response(self, body: dict, seen: set) -> list[CrawlResult]:
         items: list[CrawlResult] = []
-
         data = body.get("data", {})
         feed_list: list = (
             (data.get("list") or []) if isinstance(data, dict)
@@ -133,6 +224,9 @@ class WechatCrawler(BaseCrawler):
             or item.get("description", "")
             or ""
         )
+        if not content and not nickname:
+            return None
+
         link = item.get("shareUrl", "") or item.get("url", "") or ""
 
         ts = obj.get("createTime", 0) or item.get("createTime", 0)

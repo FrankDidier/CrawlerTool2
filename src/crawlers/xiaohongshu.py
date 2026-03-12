@@ -1,24 +1,22 @@
 """
-小红书同城爬虫 — Playwright network-intercept scraping
+小红书爬虫 — Playwright SSR extraction + network interception
 
-Navigates to https://www.xiaohongshu.com/explore, intercepts
-/api/sns/web/* API responses, and parses note items.
+Data collection strategy:
+  1. Navigate to xiaohongshu.com/explore with saved cookies
+  2. Extract SSR data from page HTML (__INITIAL_SSR_DATA__ / __NEXT_DATA__)
+  3. Intercept /api/sns/web/* API responses triggered by scrolling
+  4. Combine and deduplicate
 """
 import asyncio
+import json
 import logging
 from datetime import datetime
+
 from .base import BaseCrawler, CrawlResult
 
 logger = logging.getLogger(__name__)
 
 EXPLORE_URL = "https://www.xiaohongshu.com/explore"
-API_PATTERNS = (
-    "/api/sns/web/v1/homefeed",
-    "/api/sns/web/v1/feed",
-    "/api/sns/web/v1/search",
-    "/api/sns/web/v2/note",
-    "/api/sns/web/v1/note",
-)
 
 
 class XiaohongshuCrawler(BaseCrawler):
@@ -36,35 +34,56 @@ class XiaohongshuCrawler(BaseCrawler):
         captured: list[dict] = []
 
         async def on_response(response):
-            if not any(p in response.url for p in API_PATTERNS):
-                return
+            url = response.url
             if response.status != 200:
                 return
+            if "/api/sns/" not in url and "/api/sns/web/" not in url:
+                return
             try:
-                body = await response.json()
-                captured.append(body)
+                ct = response.headers.get("content-type", "")
+                if "json" in ct:
+                    body = await response.json()
+                    captured.append(body)
+                    logger.debug("[小红书] API captured: %s", url[:150])
             except Exception:
                 pass
 
         page.on("response", on_response)
+        ssr_items: list[dict] = []
+
         try:
-            await page.goto(EXPLORE_URL, wait_until="networkidle", timeout=30_000)
+            await page.goto(
+                EXPLORE_URL, wait_until="domcontentloaded", timeout=30_000,
+            )
+            await asyncio.sleep(4)
 
-            # Try to click 附近 / 同城 filter if available
-            try:
-                local_tab = page.locator("text=附近").first
-                if await local_tab.is_visible(timeout=3000):
-                    await local_tab.click()
-                    await asyncio.sleep(3)
-            except Exception:
-                pass
+            title = await page.title()
+            logger.info("[小红书] Page: '%s' @ %s", title, page.url)
 
-            for _ in range(3):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            ssr_items = await self._extract_ssr(page)
+            if ssr_items:
+                logger.info("[小红书] SSR: found %d items", len(ssr_items))
+
+            for label in ("附近", "同城", "本地"):
+                try:
+                    tab = page.locator(f"text={label}").first
+                    if await tab.is_visible(timeout=2000):
+                        await tab.click()
+                        await asyncio.sleep(3)
+                        logger.info("[小红书] Clicked '%s' tab", label)
+                        break
+                except Exception:
+                    continue
+
+            for _ in range(5):
+                await page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)"
+                )
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
+
         except Exception as exc:
-            logger.warning("[小红书] Page load: %s", exc)
+            logger.warning("[小红书] Page error: %s", exc)
         finally:
             page.remove_listener("response", on_response)
 
@@ -72,12 +91,85 @@ class XiaohongshuCrawler(BaseCrawler):
 
         results: list[CrawlResult] = []
         seen: set[str] = set()
+
+        for item in ssr_items:
+            r = self._parse_note(item, seen)
+            if r:
+                results.append(r)
+
         for body in captured:
             results.extend(self._parse_response(body, seen))
-        logger.info("[小红书] %d items from %d API responses", len(results), len(captured))
+
+        logger.info(
+            "[小红书] Total: %d items (SSR=%d, API captures=%d)",
+            len(results), len(ssr_items), len(captured),
+        )
         return results
 
-    # ── parsing ──
+    # ── SSR extraction ──
+
+    async def _extract_ssr(self, page) -> list[dict]:
+        try:
+            raw = await page.evaluate("""() => {
+                if (window.__INITIAL_SSR_DATA__)
+                    return JSON.stringify(window.__INITIAL_SSR_DATA__);
+                if (window.__NEXT_DATA__)
+                    return JSON.stringify(window.__NEXT_DATA__);
+                if (window.__INITIAL_STATE__)
+                    return JSON.stringify(window.__INITIAL_STATE__);
+                const el = document.getElementById('__NEXT_DATA__');
+                if (el) return el.textContent;
+                const scripts = document.querySelectorAll(
+                    'script[type="application/json"]'
+                );
+                for (const s of scripts) {
+                    if (s.textContent && s.textContent.length > 500)
+                        return s.textContent;
+                }
+                return null;
+            }""")
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return self._dig_note_items(data)
+        except Exception as exc:
+            logger.debug("[小红书] SSR error: %s", exc)
+            return []
+
+    def _dig_note_items(self, obj, depth=0) -> list[dict]:
+        if depth > 6:
+            return []
+        if isinstance(obj, list):
+            valid = [
+                i for i in obj
+                if isinstance(i, dict) and (
+                    "note_card" in i or "note" in i
+                    or ("id" in i and ("title" in i or "desc" in i or "user" in i))
+                )
+            ]
+            if valid:
+                return valid
+            out: list[dict] = []
+            for item in obj:
+                if isinstance(item, dict):
+                    out.extend(self._dig_note_items(item, depth + 1))
+            return out
+        if isinstance(obj, dict):
+            for key in ("items", "notes", "feeds", "feedList", "noteList",
+                        "data", "list"):
+                val = obj.get(key)
+                if isinstance(val, list) and val:
+                    found = self._dig_note_items(val, depth + 1)
+                    if found:
+                        return found
+            out = []
+            for val in obj.values():
+                if isinstance(val, (dict, list)):
+                    out.extend(self._dig_note_items(val, depth + 1))
+            return out
+        return []
+
+    # ── API response parsing ──
 
     def _parse_response(self, body: dict, seen: set) -> list[CrawlResult]:
         items: list[CrawlResult] = []
@@ -104,6 +196,7 @@ class XiaohongshuCrawler(BaseCrawler):
         note_id = str(
             item.get("id", "")
             or note.get("note_id", "")
+            or note.get("noteId", "")
             or note.get("id", "")
         )
         if not note_id or note_id in seen:
@@ -114,13 +207,23 @@ class XiaohongshuCrawler(BaseCrawler):
         nickname = user.get("nickname", "") or user.get("name", "")
         user_id = user.get("user_id", "") or user.get("userId", "")
 
-        title = note.get("display_title", "") or note.get("title", "")
+        title = (
+            note.get("display_title", "")
+            or note.get("title", "")
+            or item.get("display_title", "")
+        )
         desc = note.get("desc", "") or note.get("description", "")
         content = f"{title} {desc}".strip() if desc else title
+        if not content and not nickname:
+            return None
 
         link = f"https://www.xiaohongshu.com/explore/{note_id}"
 
-        ts = note.get("time", 0) or note.get("create_time", 0) or item.get("time", 0)
+        ts = (
+            note.get("time", 0)
+            or note.get("create_time", 0)
+            or item.get("time", 0)
+        )
         pub_date = self._ts_to_str(ts)
 
         return CrawlResult(

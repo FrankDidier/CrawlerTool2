@@ -23,6 +23,16 @@ PLATFORM_LOGIN_URLS = {
     "微信视频号": "https://channels.weixin.qq.com",
 }
 
+_LOGIN_COOKIE_MARKERS = {
+    "抖音": ("sessionid", "passport_csrf_token", "LOGIN_STATUS", "uid_tt",
+             "sid_tt", "ssid_ucp_v1"),
+    "快手": ("userId", "kuaishou.server.web_st", "did",
+             "passToken", "user-id"),
+    "小红书": ("web_session", "xsecappid", "a1", "webId",
+              "galaxy_creator_session_id"),
+    "微信视频号": ("wxuin", "pass_ticket", "uin", "loginInfo"),
+}
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -165,12 +175,15 @@ class BrowserManager:
             logger.warning("[%s] Cookie save failed: %s", platform, exc)
 
     def has_cookies(self, platform: str) -> bool:
-        """Check if saved cookies exist for *platform*."""
+        """Check if saved login cookies exist for *platform*."""
         p = self._cookie_path(platform)
         if not p.exists():
             return False
         try:
-            return bool(json.loads(p.read_text(encoding="utf-8")))
+            cookies = json.loads(p.read_text(encoding="utf-8"))
+            if not cookies:
+                return False
+            return self._has_login_markers(platform, cookies)
         except Exception:
             return False
 
@@ -257,9 +270,25 @@ class BrowserManager:
                     pass
                 del self._contexts[platform]
             self._pages.pop(platform, None)
-            logger.info("[%s] Saved %d cookies from login", platform, len(saved_cookies))
-            return True
+
+            is_real = self._has_login_markers(platform, saved_cookies)
+            logger.info(
+                "[%s] Saved %d cookies (login=%s)",
+                platform, len(saved_cookies), is_real,
+            )
+            return is_real
         return False
+
+    # ── Cookie validation ──
+
+    @staticmethod
+    def _has_login_markers(platform: str, cookies: list[dict]) -> bool:
+        """Check whether *cookies* contain platform-specific login markers."""
+        markers = _LOGIN_COOKIE_MARKERS.get(platform, ())
+        if not markers:
+            return bool(cookies)
+        names = {c.get("name", "") for c in cookies}
+        return any(m in names for m in markers)
 
     # ── Cleanup ──
 

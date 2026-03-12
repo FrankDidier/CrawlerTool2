@@ -1,17 +1,23 @@
 """
-快手同城爬虫 — Playwright network-intercept scraping
+快手爬虫 — Playwright SSR extraction + GraphQL interception
 
-Navigates to https://www.kuaishou.cn/samecity, intercepts GraphQL
-responses from /graphql, and parses feed items.
+Data collection strategy:
+  1. Navigate to kuaishou.cn (try /samecity, fallback to main feed)
+  2. Extract SSR data from page HTML
+  3. Intercept /graphql responses for scroll-loaded content
+  4. Combine and deduplicate
 """
 import asyncio
+import json
 import logging
 from datetime import datetime
+
 from .base import BaseCrawler, CrawlResult
 
 logger = logging.getLogger(__name__)
 
 SAMECITY_URL = "https://www.kuaishou.cn/samecity"
+FALLBACK_URL = "https://www.kuaishou.cn"
 
 
 class KuaishouCrawler(BaseCrawler):
@@ -29,25 +35,51 @@ class KuaishouCrawler(BaseCrawler):
         captured: list[dict] = []
 
         async def on_response(response):
-            if "/graphql" not in response.url:
-                return
+            url = response.url
             if response.status != 200:
                 return
+            if "/graphql" not in url and "/rest/" not in url:
+                return
             try:
-                body = await response.json()
-                captured.append(body)
+                ct = response.headers.get("content-type", "")
+                if "json" in ct:
+                    body = await response.json()
+                    captured.append(body)
+                    logger.debug("[快手] API captured: %s", url[:150])
             except Exception:
                 pass
 
         page.on("response", on_response)
+        ssr_items: list[dict] = []
+
         try:
-            await page.goto(SAMECITY_URL, wait_until="networkidle", timeout=30_000)
-            for _ in range(3):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            try:
+                await page.goto(
+                    SAMECITY_URL, wait_until="domcontentloaded", timeout=25_000,
+                )
+            except Exception:
+                logger.info("[快手] samecity unavailable, using main feed")
+                await page.goto(
+                    FALLBACK_URL, wait_until="domcontentloaded", timeout=25_000,
+                )
+
+            await asyncio.sleep(3)
+            title = await page.title()
+            logger.info("[快手] Page: '%s' @ %s", title, page.url)
+
+            ssr_items = await self._extract_ssr(page)
+            if ssr_items:
+                logger.info("[快手] SSR: found %d items", len(ssr_items))
+
+            for _ in range(5):
+                await page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)"
+                )
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
+
         except Exception as exc:
-            logger.warning("[快手] Page load: %s", exc)
+            logger.warning("[快手] Page error: %s", exc)
         finally:
             page.remove_listener("response", on_response)
 
@@ -55,12 +87,77 @@ class KuaishouCrawler(BaseCrawler):
 
         results: list[CrawlResult] = []
         seen: set[str] = set()
+
+        for item in ssr_items:
+            r = self._parse_item(item, seen)
+            if r:
+                results.append(r)
+
         for body in captured:
             results.extend(self._parse_graphql(body, seen))
-        logger.info("[快手] %d items from %d API responses", len(results), len(captured))
+
+        logger.info(
+            "[快手] Total: %d items (SSR=%d, API captures=%d)",
+            len(results), len(ssr_items), len(captured),
+        )
         return results
 
-    # ── parsing ──
+    # ── SSR extraction ──
+
+    async def _extract_ssr(self, page) -> list[dict]:
+        try:
+            raw = await page.evaluate("""() => {
+                if (window.__NEXT_DATA__) return JSON.stringify(window.__NEXT_DATA__);
+                if (window.__INITIAL_STATE__) return JSON.stringify(window.__INITIAL_STATE__);
+                const el = document.getElementById('__NEXT_DATA__');
+                if (el) return el.textContent;
+                const scripts = document.querySelectorAll('script[type="application/json"]');
+                for (const s of scripts) {
+                    if (s.textContent && s.textContent.length > 200) return s.textContent;
+                }
+                return null;
+            }""")
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return self._dig_feed_items(data)
+        except Exception as exc:
+            logger.debug("[快手] SSR error: %s", exc)
+            return []
+
+    def _dig_feed_items(self, obj, depth=0) -> list[dict]:
+        if depth > 6:
+            return []
+        if isinstance(obj, list):
+            valid = [
+                i for i in obj
+                if isinstance(i, dict) and (
+                    "id" in i or "photoId" in i or "photo" in i
+                ) and ("author" in i or "user" in i or "caption" in i)
+            ]
+            if valid:
+                return valid
+            out: list[dict] = []
+            for item in obj:
+                if isinstance(item, dict):
+                    out.extend(self._dig_feed_items(item, depth + 1))
+            return out
+        if isinstance(obj, dict):
+            for key in ("feeds", "list", "items", "pcFeeds", "feedList",
+                        "videoList", "data"):
+                val = obj.get(key)
+                if isinstance(val, list) and val:
+                    found = self._dig_feed_items(val, depth + 1)
+                    if found:
+                        return found
+            out = []
+            for val in obj.values():
+                if isinstance(val, (dict, list)):
+                    out.extend(self._dig_feed_items(val, depth + 1))
+            return out
+        return []
+
+    # ── GraphQL parsing ──
 
     def _parse_graphql(self, body: dict, seen: set) -> list[CrawlResult]:
         items: list[CrawlResult] = []
@@ -90,10 +187,11 @@ class KuaishouCrawler(BaseCrawler):
         if not isinstance(item, dict):
             return None
 
+        photo = item.get("photo") or {}
         item_id = str(
             item.get("id", "")
             or item.get("photoId", "")
-            or item.get("photo", {}).get("id", "")
+            or photo.get("id", "")
         )
         if not item_id or item_id in seen:
             return None
@@ -108,10 +206,12 @@ class KuaishouCrawler(BaseCrawler):
 
         content = (
             item.get("caption", "")
-            or item.get("photo", {}).get("caption", "")
+            or photo.get("caption", "")
             or item.get("description", "")
             or ""
         )
+        if not content and not nickname:
+            return None
 
         link = (
             item.get("webUrl", "")

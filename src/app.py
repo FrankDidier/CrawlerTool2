@@ -622,7 +622,7 @@ class MainApp(tk.Frame):
         self.crawler_manager = CrawlerManager(DB_PATH, platforms, DATA_DIR)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.lbl_status.config(text="采集中（首次启动需安装浏览器，请稍候）...")
+        self.lbl_status.config(text="采集启动中...")
 
         def run():
             loop = asyncio.new_event_loop()
