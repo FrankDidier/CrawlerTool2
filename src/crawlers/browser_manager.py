@@ -209,14 +209,33 @@ class BrowserManager:
             )
             await page.goto(url, wait_until="domcontentloaded")
 
-            while browser.is_connected():
+            done = asyncio.Event()
+            page.on("close", lambda _: done.set())
+            browser.on("disconnected", lambda: done.set())
+
+            while not done.is_set():
                 try:
                     cookies = await context.cookies()
                     if cookies:
                         saved_cookies = cookies
                 except Exception:
                     break
-                await asyncio.sleep(2)
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+
+            if browser.is_connected():
+                try:
+                    final = await context.cookies()
+                    if final:
+                        saved_cookies = final
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
         except Exception as exc:
             logger.error("[%s] Login browser error: %s", platform, exc)
