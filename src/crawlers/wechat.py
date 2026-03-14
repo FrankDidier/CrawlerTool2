@@ -121,10 +121,17 @@ class WechatCrawler(BaseCrawler):
     async def _extract_ssr(self, page) -> list[dict]:
         try:
             raw = await page.evaluate("""() => {
-                if (window.__INITIAL_DATA__)
-                    return JSON.stringify(window.__INITIAL_DATA__);
-                if (window.__NEXT_DATA__)
-                    return JSON.stringify(window.__NEXT_DATA__);
+                for (const id of ['__NEXT_DATA__', 'RENDER_DATA',
+                                   '__INITIAL_DATA__']) {
+                    const el = document.getElementById(id);
+                    if (el && el.textContent && el.textContent.length > 10)
+                        return el.textContent;
+                }
+                for (const k of ['__INITIAL_DATA__', '__NEXT_DATA__']) {
+                    const v = window[k];
+                    if (v && typeof v === 'object' && !v.nodeType)
+                        return JSON.stringify(v);
+                }
                 const scripts = document.querySelectorAll(
                     'script[type="application/json"]'
                 );

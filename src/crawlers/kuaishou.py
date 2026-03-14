@@ -107,10 +107,17 @@ class KuaishouCrawler(BaseCrawler):
     async def _extract_ssr(self, page) -> list[dict]:
         try:
             raw = await page.evaluate("""() => {
-                if (window.__NEXT_DATA__) return JSON.stringify(window.__NEXT_DATA__);
-                if (window.__INITIAL_STATE__) return JSON.stringify(window.__INITIAL_STATE__);
-                const el = document.getElementById('__NEXT_DATA__');
-                if (el) return el.textContent;
+                for (const id of ['__NEXT_DATA__', 'RENDER_DATA',
+                                   '__INITIAL_STATE__']) {
+                    const el = document.getElementById(id);
+                    if (el && el.textContent && el.textContent.length > 10)
+                        return el.textContent;
+                }
+                for (const k of ['__NEXT_DATA__', '__INITIAL_STATE__']) {
+                    const v = window[k];
+                    if (v && typeof v === 'object' && !v.nodeType)
+                        return JSON.stringify(v);
+                }
                 const scripts = document.querySelectorAll('script[type="application/json"]');
                 for (const s of scripts) {
                     if (s.textContent && s.textContent.length > 200) return s.textContent;

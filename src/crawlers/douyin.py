@@ -114,18 +114,23 @@ class DouyinCrawler(BaseCrawler):
         try:
             raw = await page.evaluate("""() => {
                 const out = [];
-                const rd = document.getElementById('RENDER_DATA');
-                if (rd && rd.textContent) {
-                    out.push({t:'RD', d: rd.textContent});
-                }
-                if (window.__NEXT_DATA__) {
-                    out.push({t:'ND', d: JSON.stringify(window.__NEXT_DATA__)});
-                }
+                const seen = new Set();
+                // Collect all script[type=application/json] by element
                 document.querySelectorAll('script[type="application/json"]').forEach(s => {
-                    if (s.textContent && s.id !== 'RENDER_DATA') {
+                    if (s.textContent && s.textContent.length > 10) {
                         out.push({t: s.id || 'script', d: s.textContent});
+                        if (s.id) seen.add(s.id);
                     }
                 });
+                // Window properties (skip DOM element refs)
+                for (const k of ['__NEXT_DATA__', '__INITIAL_STATE__',
+                                  '__INITIAL_SSR_DATA__']) {
+                    if (seen.has(k)) continue;
+                    const v = window[k];
+                    if (v && typeof v === 'object' && !v.nodeType) {
+                        out.push({t: k, d: JSON.stringify(v)});
+                    }
+                }
                 return out;
             }""")
 
