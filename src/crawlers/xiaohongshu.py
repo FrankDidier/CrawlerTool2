@@ -37,7 +37,9 @@ class XiaohongshuCrawler(BaseCrawler):
             url = response.url
             if response.status != 200:
                 return
-            if "/api/sns/" not in url and "/api/sns/web/" not in url:
+            if not any(p in url for p in (
+                "/homefeed", "/feed", "/search", "/note",
+            )):
                 return
             try:
                 ct = response.headers.get("content-type", "")

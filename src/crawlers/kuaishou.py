@@ -38,7 +38,7 @@ class KuaishouCrawler(BaseCrawler):
             url = response.url
             if response.status != 200:
                 return
-            if "/graphql" not in url and "/rest/" not in url:
+            if "/graphql" not in url:
                 return
             try:
                 ct = response.headers.get("content-type", "")
