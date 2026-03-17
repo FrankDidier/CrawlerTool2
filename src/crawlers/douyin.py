@@ -3,9 +3,10 @@
 
 Data collection strategy:
   1. Navigate to douyin.com with saved cookies
-  2. Extract feed data embedded in SSR HTML (RENDER_DATA)
-  3. Intercept /aweme/ API responses triggered by scrolling
-  4. Combine both sources and deduplicate
+  2. Try to switch to 同城 (local city) tab
+  3. Extract feed data embedded in SSR HTML (RENDER_DATA)
+  4. Intercept /aweme/ API responses triggered by scrolling
+  5. Combine both sources and deduplicate
 """
 import asyncio
 import json
@@ -23,6 +24,47 @@ DOUYIN_URL = "https://www.douyin.com"
 class DouyinCrawler(BaseCrawler):
     platform_name = "抖音"
 
+    async def _try_switch_tongcheng(self, page) -> bool:
+        """Try multiple selectors to switch to 同城 tab."""
+        selectors = [
+            'a:has-text("同城")',
+            'div[role="tab"]:has-text("同城")',
+            'span:has-text("同城")',
+            'text=同城',
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    await asyncio.sleep(3)
+                    logger.info("[抖音] Clicked 同城 tab via: %s", sel)
+                    return True
+            except Exception:
+                continue
+
+        try:
+            found = await page.evaluate("""() => {
+                const links = document.querySelectorAll('a, div, span, li');
+                for (const el of links) {
+                    const t = el.textContent?.trim();
+                    if (t === '同城' || t === '附近') {
+                        el.click();
+                        return t;
+                    }
+                }
+                return null;
+            }""")
+            if found:
+                await asyncio.sleep(3)
+                logger.info("[抖音] Clicked '%s' tab via JS", found)
+                return True
+        except Exception:
+            pass
+
+        logger.info("[抖音] 同城 tab not found on desktop web, using default feed")
+        return False
+
     async def fetch_tongcheng(self) -> list[CrawlResult]:
         if not self.bm:
             return []
@@ -38,7 +80,7 @@ class DouyinCrawler(BaseCrawler):
             url = response.url
             if response.status != 200:
                 return
-            if "/aweme/" not in url:
+            if "/aweme/" not in url and "/nearby/" not in url:
                 return
             try:
                 ct = response.headers.get("content-type", "")
@@ -61,20 +103,14 @@ class DouyinCrawler(BaseCrawler):
             title = await page.title()
             logger.info("[抖音] Page: '%s' @ %s", title, page.url)
 
+            await self._try_switch_tongcheng(page)
+            await asyncio.sleep(2)
+
             ssr_items = await self._extract_ssr(page)
             if ssr_items:
                 logger.info("[抖音] SSR: found %d items in page HTML", len(ssr_items))
             else:
                 logger.info("[抖音] SSR: no embedded data found, relying on API interception")
-
-            try:
-                tab = page.locator("text=同城").first
-                if await tab.is_visible(timeout=3000):
-                    await tab.click()
-                    await asyncio.sleep(3)
-                    logger.info("[抖音] Clicked 同城 tab")
-            except Exception:
-                pass
 
             for _ in range(5):
                 await page.evaluate(

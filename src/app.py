@@ -157,6 +157,21 @@ class DataPanel(ttk.Frame):
         self.tv.configure(yscrollcommand=scroll.set)
         self.tv.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        self.tv.bind("<Double-1>", self._on_double_click)
+
+    def _on_double_click(self, event):
+        """Double-click a row to open the link column in a browser."""
+        item = self.tv.identify_row(event.y)
+        if not item:
+            return
+        idx = self.tv.index(item)
+        if idx >= len(self._all_rows):
+            return
+        row = self._all_rows[idx]
+        link = row.get("link", "")
+        if link:
+            import webbrowser
+            webbrowser.open(link)
 
     # ── 选择 ──
 
@@ -218,7 +233,7 @@ class DataPanel(ttk.Frame):
             lines.append(f"[{d.get('platform','')}] {d.get('nickname','')}: "
                          f"{str(d.get('content',''))[:100]}  {d.get('link','')}")
         text = "\n".join(lines)
-        title = self.table_name
+        title = "出现相关负面舆情，请及时关注处理"
         ok = send_dingtalk(url, title, text) if channel == "dingtalk" else send_wechat(url, title, text)
         messagebox.showinfo("完成" if ok else "失败", "已发送" if ok else "发送失败，请检查设置")
 
@@ -234,6 +249,15 @@ class CollectionPanel(DataPanel):
     def _build_toolbar(self):
         super()._build_toolbar()
         tb = self.toolbar
+
+        ttk.Label(tb, text="平台:").pack(side="left")
+        self.platform_filter = tk.StringVar(value="全部")
+        pf_combo = ttk.Combobox(
+            tb, textvariable=self.platform_filter, width=8,
+            values=["全部"] + list(CRAWLERS.keys()), state="readonly",
+        )
+        pf_combo.pack(side="left", padx=4)
+        pf_combo.bind("<<ComboboxSelected>>", lambda _: self._do_refresh())
 
         ttk.Label(tb, text="搜索:").pack(side="left")
         self.search_var = tk.StringVar()
@@ -257,6 +281,7 @@ class CollectionPanel(DataPanel):
     def _do_refresh(self):
         kw = self.search_var.get().strip()
         d_start, d_end = self.date_bar.get_range()
+        pf = self.platform_filter.get()
 
         def do():
             async def _():
@@ -265,6 +290,9 @@ class CollectionPanel(DataPanel):
                     sql = ("SELECT id, platform, item_id, nickname, content, link, publish_date "
                            "FROM collection WHERE 1=1")
                     params: list = []
+                    if pf and pf != "全部":
+                        sql += " AND platform = ?"
+                        params.append(pf)
                     if kw:
                         sql += " AND (content LIKE ? OR nickname LIKE ?)"
                         params += [f"%{kw}%", f"%{kw}%"]
@@ -293,7 +321,8 @@ class NegativePanel(DataPanel):
     def _build_toolbar(self):
         super()._build_toolbar()
         tb = self.toolbar
-        ttk.Button(tb, text="语义判断", command=self.app._run_sentiment).pack(side="left", padx=2)
+        ttk.Button(tb, text="按条件分析", command=self.app._run_sentiment_filtered).pack(side="left", padx=2)
+        ttk.Button(tb, text="分析全部", command=self.app._run_sentiment_all).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="全选", command=self._select_all).pack(side="left", padx=2)
         ttk.Button(tb, text="反选", command=self._deselect_all).pack(side="left", padx=2)
@@ -342,7 +371,9 @@ class WatchedPanel(DataPanel):
         super()._build_toolbar()
         tb = self.toolbar
         ttk.Button(tb, text="添加关注", command=self.app._add_watch).pack(side="left", padx=2)
+        ttk.Button(tb, text="查看关注列表", command=self.app._view_watch_list).pack(side="left", padx=2)
         ttk.Button(tb, text="Excel导入", command=self.app._import_watch_excel).pack(side="left", padx=2)
+        ttk.Button(tb, text="下载模板", command=self.app._download_watch_template).pack(side="left", padx=2)
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(tb, text="全选", command=self._select_all).pack(side="left", padx=2)
         ttk.Button(tb, text="反选", command=self._deselect_all).pack(side="left", padx=2)
@@ -486,7 +517,7 @@ class MainApp(tk.Frame):
         """综合设置窗口：平台登录 + 大模型 API + 钉钉 + 微信"""
         win = tk.Toplevel(self)
         win.title("设置")
-        win.geometry("500x580")
+        win.geometry("520x650")
         cfg = load_config()
 
         # --- 平台登录 ---
@@ -528,6 +559,61 @@ class MainApp(tk.Frame):
         e_model = ttk.Entry(lf1, width=50)
         e_model.insert(0, cfg.get("llm", {}).get("model", ""))
         e_model.grid(row=2, column=1, padx=5, pady=3)
+
+        def test_llm_api():
+            url = e_url.get().strip()
+            key = e_key.get().strip()
+            mdl = e_model.get().strip()
+            if not key or not mdl:
+                messagebox.showwarning("提示", "请先填写 API Key 和模型名",
+                                       parent=win)
+                return
+
+            test_lbl.config(text="测试中...", foreground="orange")
+
+            def do():
+                async def _():
+                    try:
+                        results = await sentiment_analyze(
+                            url, key, mdl, ["这是一条测试文本，今天天气不错"])
+                        r = results[0] if results else {}
+                        s = r.get("sentiment", "未知")
+                        remark = r.get("remark", "")
+                        if "未配置" in remark or "解析失败" in remark:
+                            raise Exception(remark)
+                        self.after(0, lambda: (
+                            test_lbl.config(text="测试成功！API 可正常调用",
+                                            foreground="green"),
+                            messagebox.showinfo(
+                                "测试成功",
+                                f"API 调用正常！\n\n"
+                                f"测试结果: 情感={s}\n备注: {remark}",
+                                parent=win,
+                            ),
+                        ))
+                    except Exception as e:
+                        err = str(e)
+                        self.after(0, lambda: (
+                            test_lbl.config(text="测试失败", foreground="red"),
+                            messagebox.showerror(
+                                "测试失败",
+                                f"API 调用失败。\n\n"
+                                f"错误信息:\n{err}\n\n"
+                                "请检查:\n"
+                                "1. API 地址是否正确\n"
+                                "2. API Key 是否有效（是否欠费）\n"
+                                "3. 模型名是否正确",
+                                parent=win,
+                            ),
+                        ))
+                run_async(_())
+            threading.Thread(target=do, daemon=True).start()
+
+        test_row = ttk.Frame(lf1)
+        test_row.grid(row=3, column=0, columnspan=2, pady=5)
+        ttk.Button(test_row, text="测试 API", command=test_llm_api).pack(side="left", padx=5)
+        test_lbl = ttk.Label(test_row, text="", foreground="gray")
+        test_lbl.pack(side="left", padx=5)
 
         # --- 钉钉 ---
         lf2 = ttk.LabelFrame(win, text="钉钉机器人")
@@ -642,6 +728,7 @@ class MainApp(tk.Frame):
         else:
             parts = [f"{p}:+{n}" for p, (n, _) in stats.items()]
             self.lbl_status.config(text=" | ".join(parts) if parts else "采集中...")
+        self.panel_collection._do_refresh()
         self._check_watchlist()
 
     def _check_watchlist(self):
@@ -690,36 +777,162 @@ class MainApp(tk.Frame):
 
     # ── 语义判断 ──
 
-    def _run_sentiment(self):
+    def _check_llm_config(self):
         cfg = load_config()
         api_key = cfg.get("llm", {}).get("api_key", "")
         model = cfg.get("llm", {}).get("model", "")
         if not api_key or not model:
             messagebox.showwarning("提示", "请先在「设置」中配置大模型 API Key 和模型名")
+            return None
+        return cfg
+
+    def _run_sentiment_filtered(self):
+        """Open dialog for user to select date range and platforms, then batch analyze."""
+        cfg = self._check_llm_config()
+        if not cfg:
             return
+
+        win = tk.Toplevel(self)
+        win.title("按条件批量分析")
+        win.geometry("400x320")
+
+        ttk.Label(win, text="选择平台（可多选）:").pack(anchor="w", padx=10, pady=(10, 2))
+        pf_frame = ttk.Frame(win)
+        pf_frame.pack(fill="x", padx=10)
+        pf_vars = {}
+        for p in CRAWLERS:
+            v = tk.BooleanVar(value=True)
+            pf_vars[p] = v
+            ttk.Checkbutton(pf_frame, text=p, variable=v).pack(side="left", padx=5)
+
+        ttk.Label(win, text="日期范围:").pack(anchor="w", padx=10, pady=(10, 2))
+        date_frame = ttk.Frame(win)
+        date_frame.pack(fill="x", padx=10)
+        if HAS_CALENDAR:
+            d_start = DateEntry(date_frame, width=12, date_pattern="yyyy-MM-dd",
+                                year=2024, month=1, day=1)
+        else:
+            d_start = ttk.Entry(date_frame, width=12)
+            d_start.insert(0, "2024-01-01")
+        d_start.pack(side="left")
+        ttk.Label(date_frame, text=" ~ ").pack(side="left")
+        if HAS_CALENDAR:
+            d_end = DateEntry(date_frame, width=12, date_pattern="yyyy-MM-dd")
+        else:
+            d_end = ttk.Entry(date_frame, width=12)
+            d_end.insert(0, date.today().isoformat())
+        d_end.pack(side="left")
+
+        info_lbl = ttk.Label(win, text="", foreground="gray")
+        info_lbl.pack(anchor="w", padx=10, pady=5)
+
+        progress_var = tk.StringVar(value="")
+        progress_lbl = ttk.Label(win, textvariable=progress_var, foreground="blue")
+        progress_lbl.pack(anchor="w", padx=10, pady=2)
+
+        def count_items():
+            platforms = [p for p, v in pf_vars.items() if v.get()]
+            ds = str(d_start.get_date() if HAS_CALENDAR else d_start.get())
+            de = str(d_end.get_date() if HAS_CALENDAR else d_end.get())
+
+            def do():
+                items = run_async(database.get_unanalyzed_collection(
+                    DB_PATH, platforms=platforms, date_start=ds, date_end=de))
+                self.after(0, lambda: info_lbl.config(
+                    text=f"符合条件的未分析数据: {len(items)} 条"))
+            threading.Thread(target=do, daemon=True).start()
+
+        ttk.Button(win, text="查询数量", command=count_items).pack(pady=5)
+
+        def start_analysis():
+            platforms = [p for p, v in pf_vars.items() if v.get()]
+            ds = str(d_start.get_date() if HAS_CALENDAR else d_start.get())
+            de = str(d_end.get_date() if HAS_CALENDAR else d_end.get())
+            self._do_batch_sentiment(cfg, platforms, ds, de, 0, progress_var, win)
+
+        ttk.Button(win, text="开始分析", command=start_analysis).pack(pady=10)
+
+    def _run_sentiment_all(self):
+        """Analyze all unanalyzed items in the database."""
+        cfg = self._check_llm_config()
+        if not cfg:
+            return
+        cnt = run_async(database.count_unanalyzed(DB_PATH))
+        if cnt == 0:
+            messagebox.showinfo("提示", "所有数据已分析完毕，无新增待分析项。")
+            return
+        if not messagebox.askyesno(
+            "确认",
+            f"采集库中共有 {cnt} 条未分析数据。\n\n"
+            "将提交全部数据进行批量语义分析。\n"
+            "已分析过的数据不会重复分析。\n\n"
+            "是否开始？",
+        ):
+            return
+        win = tk.Toplevel(self)
+        win.title("批量分析全部数据")
+        win.geometry("350x100")
+        progress_var = tk.StringVar(value="准备中...")
+        ttk.Label(win, textvariable=progress_var).pack(padx=10, pady=20)
+        self._do_batch_sentiment(cfg, None, None, None, 0, progress_var, win)
+
+    def _do_batch_sentiment(self, cfg, platforms, date_start, date_end,
+                            limit, progress_var, win):
+        BATCH = 20
 
         def do():
             async def _():
-                batch = await database.get_collection_batch(DB_PATH, limit=20)
-                if not batch:
-                    self.after(0, lambda: messagebox.showinfo("提示", "暂无待分析数据"))
-                    return
-                texts = [r.get("content", "") for r in batch]
-                results = await sentiment_analyze(
-                    cfg["llm"]["base_url"], cfg["llm"]["api_key"],
-                    cfg["llm"]["model"], texts,
+                items = await database.get_unanalyzed_collection(
+                    DB_PATH, platforms=platforms,
+                    date_start=date_start, date_end=date_end,
+                    limit=limit,
                 )
-                cnt = 0
-                for i, r in enumerate(batch):
-                    if i < len(results) and results[i].get("sentiment") == "负面":
-                        await database.insert_negative(DB_PATH, {
-                            **r, "collection_id": r["id"],
-                            "sentiment": "负面",
-                            "remark": results[i].get("remark", ""),
-                        })
-                        cnt += 1
+                total = len(items)
+                if total == 0:
+                    self.after(0, lambda: (
+                        progress_var.set("无待分析数据（已全部分析或无匹配项）"),
+                        messagebox.showinfo("完成", "无新增待分析数据。", parent=win),
+                    ))
+                    return
+
+                analyzed = 0
+                negative_cnt = 0
+                for start in range(0, total, BATCH):
+                    batch = items[start:start + BATCH]
+                    self.after(0, lambda s=start, t=total:
+                               progress_var.set(f"分析中... {s}/{t}"))
+                    texts = [r.get("content", "") for r in batch]
+                    try:
+                        results = await sentiment_analyze(
+                            cfg["llm"]["base_url"], cfg["llm"]["api_key"],
+                            cfg["llm"]["model"], texts,
+                        )
+                    except Exception as e:
+                        self.after(0, lambda e=e: (
+                            progress_var.set(f"API 调用出错: {e}"),
+                            messagebox.showerror("错误",
+                                                 f"大模型 API 调用失败:\n{e}", parent=win),
+                        ))
+                        return
+                    for i, r in enumerate(batch):
+                        analyzed += 1
+                        if i < len(results) and results[i].get("sentiment") == "负面":
+                            await database.insert_negative(DB_PATH, {
+                                **r, "collection_id": r["id"],
+                                "sentiment": "负面",
+                                "remark": results[i].get("remark", ""),
+                            })
+                            negative_cnt += 1
+
                 self.after(0, lambda: (
-                    messagebox.showinfo("完成", f"已分析 {len(batch)} 条，{cnt} 条负面已存入"),
+                    progress_var.set(
+                        f"完成！共分析 {analyzed} 条，发现 {negative_cnt} 条负面"),
+                    messagebox.showinfo(
+                        "完成",
+                        f"共分析 {analyzed} 条数据\n"
+                        f"发现 {negative_cnt} 条负面言论已存入",
+                        parent=win,
+                    ),
                     self.panel_negative._do_refresh(),
                 ))
             run_async(_())
@@ -783,6 +996,85 @@ class MainApp(tk.Frame):
             threading.Thread(target=do, daemon=True).start()
         except Exception as e:
             messagebox.showerror("错误", str(e))
+
+    def _view_watch_list(self):
+        """View and manage all watch targets."""
+        win = tk.Toplevel(self)
+        win.title("关注对象列表")
+        win.geometry("550x400")
+
+        tv = ttk.Treeview(win, columns=("ID", "平台", "用户ID", "昵称", "添加时间"),
+                          show="headings", height=14, selectmode="extended")
+        tv.heading("ID", text="ID")
+        tv.heading("平台", text="平台")
+        tv.heading("用户ID", text="用户ID")
+        tv.heading("昵称", text="昵称")
+        tv.heading("添加时间", text="添加时间")
+        tv.column("ID", width=40)
+        tv.column("平台", width=80)
+        tv.column("用户ID", width=120)
+        tv.column("昵称", width=120)
+        tv.column("添加时间", width=140)
+
+        scroll = ttk.Scrollbar(win, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll.set)
+        tv.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        scroll.pack(side="left", fill="y", pady=10)
+
+        def load():
+            for iid in tv.get_children():
+                tv.delete(iid)
+            items = run_async(database.list_watch_config(DB_PATH))
+            for item in items:
+                tv.insert("", "end", values=(
+                    item["id"], item["platform"], item["target_id"],
+                    item.get("target_name", ""), item.get("created_at", ""),
+                ))
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(side="right", fill="y", padx=10, pady=10)
+
+        def delete_selected():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showwarning("提示", "请先选择要删除的关注对象", parent=win)
+                return
+            if not messagebox.askyesno("确认",
+                                       f"确定删除选中的 {len(sel)} 个关注对象？",
+                                       parent=win):
+                return
+            for iid in sel:
+                vals = tv.item(iid, "values")
+                config_id = int(vals[0])
+                run_async(database.delete_watch_config_by_id(DB_PATH, config_id))
+            load()
+            messagebox.showinfo("完成", "已删除", parent=win)
+
+        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(pady=5)
+        ttk.Button(btn_frame, text="刷新", command=load).pack(pady=5)
+
+        load()
+
+    def _download_watch_template(self):
+        """Download a template Excel file for importing watch targets."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile="关注对象导入模板.xlsx",
+        )
+        if not path:
+            return
+        df = pd.DataFrame({
+            "平台": ["抖音", "快手", "小红书", "微信视频号"],
+            "ID": ["user_id_123", "user_456", "note_user_789", "wx_user_001"],
+            "昵称": ["示例昵称1", "示例昵称2", "示例昵称3", "示例昵称4"],
+        })
+        df.to_excel(path, index=False, engine="openpyxl")
+        messagebox.showinfo("成功", f"模板已保存到:\n{path}\n\n"
+                            "请按照模板格式填写后再导入。\n"
+                            "「平台」列必须为：抖音、快手、小红书、微信视频号 之一\n"
+                            "「ID」列为该平台的用户ID\n"
+                            "「昵称」列可选")
 
     # ── 管理 ──
 

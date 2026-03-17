@@ -248,3 +248,69 @@ async def get_collection_by_ids(db_path: Path, ids: list[int]) -> list[dict]:
         )
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def get_unanalyzed_collection(
+    db_path: Path,
+    platforms: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    limit: int = 0,
+) -> list[dict]:
+    """Get collection items not yet analyzed for sentiment (not in negative table)."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        sql = (
+            "SELECT c.id, c.platform, c.item_id, c.nickname, c.content, "
+            "c.link, c.publish_date "
+            "FROM collection c "
+            "LEFT JOIN negative n ON c.id = n.collection_id "
+            "WHERE n.id IS NULL"
+        )
+        params: list = []
+        if platforms:
+            ph = ",".join("?" * len(platforms))
+            sql += f" AND c.platform IN ({ph})"
+            params.extend(platforms)
+        if date_start:
+            sql += " AND c.publish_date >= ?"
+            params.append(date_start)
+        if date_end:
+            sql += " AND c.publish_date <= ?"
+            params.append(date_end + " 23:59:59")
+        sql += " ORDER BY c.id"
+        if limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        cur = await db.execute(sql, params)
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def count_unanalyzed(db_path: Path) -> int:
+    """Count collection items not yet analyzed."""
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM collection c "
+            "LEFT JOIN negative n ON c.id = n.collection_id "
+            "WHERE n.id IS NULL"
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def list_watch_config(db_path: Path) -> list[dict]:
+    """List all watch config entries with id for deletion."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT id, platform, target_id, target_name, created_at "
+            "FROM watch_config ORDER BY id"
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def delete_watch_config_by_id(db_path: Path, config_id: int) -> bool:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("DELETE FROM watch_config WHERE id = ?", (config_id,))
+        await db.commit()
+    return True

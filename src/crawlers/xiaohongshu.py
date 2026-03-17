@@ -66,16 +66,48 @@ class XiaohongshuCrawler(BaseCrawler):
             if ssr_items:
                 logger.info("[小红书] SSR: found %d items", len(ssr_items))
 
+            found_local = False
             for label in ("附近", "同城", "本地"):
+                selectors = [
+                    f'a:has-text("{label}")',
+                    f'div[role="tab"]:has-text("{label}")',
+                    f'span:has-text("{label}")',
+                    f'text={label}',
+                ]
+                for sel in selectors:
+                    try:
+                        tab = page.locator(sel).first
+                        if await tab.is_visible(timeout=2000):
+                            await tab.click()
+                            await asyncio.sleep(3)
+                            logger.info("[小红书] Clicked '%s' tab via %s", label, sel)
+                            found_local = True
+                            break
+                    except Exception:
+                        continue
+                if found_local:
+                    break
+
+            if not found_local:
                 try:
-                    tab = page.locator(f"text={label}").first
-                    if await tab.is_visible(timeout=2000):
-                        await tab.click()
+                    clicked = await page.evaluate("""() => {
+                        const els = document.querySelectorAll('a, div, span, li');
+                        for (const el of els) {
+                            const t = el.textContent?.trim();
+                            if (t === '附近' || t === '同城' || t === '本地') {
+                                el.click();
+                                return t;
+                            }
+                        }
+                        return null;
+                    }""")
+                    if clicked:
                         await asyncio.sleep(3)
-                        logger.info("[小红书] Clicked '%s' tab", label)
-                        break
+                        logger.info("[小红书] Clicked '%s' via JS", clicked)
+                    else:
+                        logger.info("[小红书] 附近/同城 tab not found, using default feed")
                 except Exception:
-                    continue
+                    logger.info("[小红书] 附近/同城 tab not found, using default feed")
 
             for _ in range(5):
                 await page.evaluate(

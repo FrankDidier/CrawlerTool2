@@ -9,9 +9,10 @@ def send_dingtalk(webhook_url: str, title: str, text: str) -> bool:
     if not webhook_url:
         return False
     try:
+        content = f"【舆情预警】{title}\n{text}"
         r = requests.post(
             webhook_url,
-            json={"msgtype": "text", "text": {"content": f"{title}\n{text}"}},
+            json={"msgtype": "text", "text": {"content": content}},
             timeout=10,
         )
         return r.status_code == 200
