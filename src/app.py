@@ -297,10 +297,12 @@ class CollectionPanel(DataPanel):
                         sql += " AND (content LIKE ? OR nickname LIKE ?)"
                         params += [f"%{kw}%", f"%{kw}%"]
                     if d_start:
-                        sql += " AND publish_date >= ?"
+                        sql += (" AND (publish_date >= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_start)
                     if d_end:
-                        sql += " AND publish_date <= ?"
+                        sql += (" AND (publish_date <= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_end + " 23:59:59")
                     sql += " ORDER BY id DESC LIMIT 500"
                     cur = await db.execute(sql, params)
@@ -346,10 +348,12 @@ class NegativePanel(DataPanel):
                            "sentiment, remark, publish_date FROM negative WHERE 1=1")
                     params: list = []
                     if d_start:
-                        sql += " AND publish_date >= ?"
+                        sql += (" AND (publish_date >= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_start)
                     if d_end:
-                        sql += " AND publish_date <= ?"
+                        sql += (" AND (publish_date <= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_end + " 23:59:59")
                     sql += " ORDER BY id DESC LIMIT 500"
                     cur = await db.execute(sql, params)
@@ -397,10 +401,12 @@ class WatchedPanel(DataPanel):
                            "watch_target_name, publish_date FROM watched WHERE 1=1")
                     params: list = []
                     if d_start:
-                        sql += " AND publish_date >= ?"
+                        sql += (" AND (publish_date >= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_start)
                     if d_end:
-                        sql += " AND publish_date <= ?"
+                        sql += (" AND (publish_date <= ? OR publish_date = ''"
+                                " OR publish_date IS NULL)")
                         params.append(d_end + " 23:59:59")
                     sql += " ORDER BY id DESC LIMIT 500"
                     cur = await db.execute(sql, params)
@@ -742,8 +748,13 @@ class MainApp(tk.Frame):
                 if r["id"] in already:
                     continue
                 for w in watch_list:
+                    nick = r.get("nickname", "")
+                    iid = r.get("item_id", "")
+                    wid = w["target_id"]
+                    wname = w.get("target_name", "")
                     if w["platform"] == r["platform"] and (
-                        w["target_id"] == r.get("item_id") or w["target_name"] == r.get("nickname")
+                        (wid and wid in (iid, nick))
+                        or (wname and wname == nick)
                     ):
                         await database.insert_watched(DB_PATH, {
                             **r, "collection_id": r["id"],
@@ -943,28 +954,39 @@ class MainApp(tk.Frame):
     def _add_watch(self):
         win = tk.Toplevel(self)
         win.title("添加关注对象")
+        win.geometry("340x280")
+
         ttk.Label(win, text="平台").pack(anchor="w", padx=10, pady=5)
         pvar = tk.StringVar(value="抖音")
         ttk.Combobox(win, textvariable=pvar, values=list(CRAWLERS.keys()),
                      state="readonly").pack(padx=10, pady=5, fill="x")
-        ttk.Label(win, text="ID").pack(anchor="w", padx=10, pady=5)
-        eid = ttk.Entry(win, width=30)
-        eid.pack(padx=10, pady=5, fill="x")
-        ttk.Label(win, text="昵称（选填）").pack(anchor="w", padx=10, pady=5)
+
+        ttk.Label(win, text="昵称").pack(anchor="w", padx=10, pady=5)
         ename = ttk.Entry(win, width=30)
         ename.pack(padx=10, pady=5, fill="x")
 
+        ttk.Label(win, text="平台号 / ID（选填，如抖音号）").pack(anchor="w", padx=10, pady=5)
+        eid = ttk.Entry(win, width=30)
+        eid.pack(padx=10, pady=5, fill="x")
+
+        ttk.Label(win, text="提示：昵称和平台号至少填写一项",
+                  foreground="gray").pack(anchor="w", padx=10)
+
         def save():
-            p, tid, tn = pvar.get(), eid.get().strip(), ename.get().strip()
-            if not tid:
-                messagebox.showerror("错误", "请输入ID")
+            p = pvar.get()
+            tid = eid.get().strip()
+            tn = ename.get().strip()
+            if not tid and not tn:
+                messagebox.showerror("错误", "请至少填写「昵称」或「平台号/ID」",
+                                     parent=win)
                 return
-            ok = run_async(database.add_watch_config(DB_PATH, p, tid, tn))
+            target_id = tid or tn
+            ok = run_async(database.add_watch_config(DB_PATH, p, target_id, tn))
             if ok:
-                messagebox.showinfo("成功", "已添加")
+                messagebox.showinfo("成功", "已添加", parent=win)
                 win.destroy()
             else:
-                messagebox.showerror("错误", "添加失败")
+                messagebox.showerror("错误", "添加失败", parent=win)
         ttk.Button(win, text="保存", command=save).pack(pady=10)
 
     def _import_watch_excel(self):
@@ -975,24 +997,36 @@ class MainApp(tk.Frame):
             df = pd.read_excel(path)
             cols = df.columns.tolist()
             pc = "平台" if "平台" in cols else (cols[0] if cols else "")
-            ic = "ID" if "ID" in cols else ("item_id" if "item_id" in cols else (cols[1] if len(cols) > 1 else ""))
-            nc = "昵称" if "昵称" in cols else ("nickname" if "nickname" in cols else "")
-            if not pc or not ic:
-                messagebox.showerror("错误", "Excel 需包含「平台」「ID」列")
+            ic = ("ID" if "ID" in cols
+                  else "item_id" if "item_id" in cols
+                  else "平台号" if "平台号" in cols
+                  else "")
+            nc = ("昵称" if "昵称" in cols
+                  else "nickname" if "nickname" in cols
+                  else "")
+            if not pc or (not ic and not nc):
+                messagebox.showerror("错误",
+                                     "Excel 需包含「平台」列，"
+                                     "以及「ID」或「昵称」列中至少一列")
                 return
 
             def do():
+                cnt = 0
                 for _, row in df.iterrows():
                     platform = str(row.get(pc, "")).strip()
-                    tid = str(row.get(ic, "")).strip()
+                    tid = str(row.get(ic, "")).strip() if ic else ""
                     tname = str(row.get(nc, "")).strip() if nc else ""
                     if tid.lower() == "nan":
                         tid = ""
                     if tname.lower() == "nan":
                         tname = ""
-                    if platform and tid and platform in CRAWLERS:
-                        run_async(database.add_watch_config(DB_PATH, platform, tid, tname))
-                self.after(0, lambda: messagebox.showinfo("完成", "导入完成"))
+                    target_id = tid or tname
+                    if platform and target_id and platform in CRAWLERS:
+                        run_async(database.add_watch_config(
+                            DB_PATH, platform, target_id, tname))
+                        cnt += 1
+                self.after(0, lambda: messagebox.showinfo(
+                    "完成", f"成功导入 {cnt} 个关注对象"))
             threading.Thread(target=do, daemon=True).start()
         except Exception as e:
             messagebox.showerror("错误", str(e))
@@ -1001,38 +1035,10 @@ class MainApp(tk.Frame):
         """View and manage all watch targets."""
         win = tk.Toplevel(self)
         win.title("关注对象列表")
-        win.geometry("550x400")
+        win.geometry("600x420")
 
-        tv = ttk.Treeview(win, columns=("ID", "平台", "用户ID", "昵称", "添加时间"),
-                          show="headings", height=14, selectmode="extended")
-        tv.heading("ID", text="ID")
-        tv.heading("平台", text="平台")
-        tv.heading("用户ID", text="用户ID")
-        tv.heading("昵称", text="昵称")
-        tv.heading("添加时间", text="添加时间")
-        tv.column("ID", width=40)
-        tv.column("平台", width=80)
-        tv.column("用户ID", width=120)
-        tv.column("昵称", width=120)
-        tv.column("添加时间", width=140)
-
-        scroll = ttk.Scrollbar(win, orient="vertical", command=tv.yview)
-        tv.configure(yscrollcommand=scroll.set)
-        tv.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
-        scroll.pack(side="left", fill="y", pady=10)
-
-        def load():
-            for iid in tv.get_children():
-                tv.delete(iid)
-            items = run_async(database.list_watch_config(DB_PATH))
-            for item in items:
-                tv.insert("", "end", values=(
-                    item["id"], item["platform"], item["target_id"],
-                    item.get("target_name", ""), item.get("created_at", ""),
-                ))
-
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(side="right", fill="y", padx=10, pady=10)
+        btn_bar = ttk.Frame(win)
+        btn_bar.pack(fill="x", padx=10, pady=(10, 4))
 
         def delete_selected():
             sel = tv.selection()
@@ -1050,8 +1056,47 @@ class MainApp(tk.Frame):
             load()
             messagebox.showinfo("完成", "已删除", parent=win)
 
-        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(pady=5)
-        ttk.Button(btn_frame, text="刷新", command=load).pack(pady=5)
+        ttk.Button(btn_bar, text="删除选中", command=delete_selected).pack(side="left", padx=5)
+        ttk.Button(btn_bar, text="全选", command=lambda: [
+            tv.selection_add(iid) for iid in tv.get_children()
+        ]).pack(side="left", padx=5)
+        ttk.Button(btn_bar, text="刷新", command=lambda: load()).pack(side="left", padx=5)
+
+        count_lbl = ttk.Label(btn_bar, text="", foreground="gray")
+        count_lbl.pack(side="right", padx=5)
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        tv = ttk.Treeview(tree_frame,
+                          columns=("ID", "平台", "平台号/ID", "昵称", "添加时间"),
+                          show="headings", height=14, selectmode="extended")
+        tv.heading("ID", text="#")
+        tv.heading("平台", text="平台")
+        tv.heading("平台号/ID", text="平台号/ID")
+        tv.heading("昵称", text="昵称")
+        tv.heading("添加时间", text="添加时间")
+        tv.column("ID", width=35)
+        tv.column("平台", width=80)
+        tv.column("平台号/ID", width=140)
+        tv.column("昵称", width=140)
+        tv.column("添加时间", width=140)
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll.set)
+        tv.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def load():
+            for iid in tv.get_children():
+                tv.delete(iid)
+            items = run_async(database.list_watch_config(DB_PATH))
+            for item in items:
+                tv.insert("", "end", values=(
+                    item["id"], item["platform"], item["target_id"],
+                    item.get("target_name", ""), item.get("created_at", ""),
+                ))
+            count_lbl.config(text=f"共 {len(items)} 个关注对象")
 
         load()
 
@@ -1066,15 +1111,16 @@ class MainApp(tk.Frame):
             return
         df = pd.DataFrame({
             "平台": ["抖音", "快手", "小红书", "微信视频号"],
-            "ID": ["user_id_123", "user_456", "note_user_789", "wx_user_001"],
-            "昵称": ["示例昵称1", "示例昵称2", "示例昵称3", "示例昵称4"],
+            "ID": ["抖音号或留空", "快手号或留空", "", ""],
+            "昵称": ["张三", "李四", "王五的昵称", "赵六的昵称"],
         })
         df.to_excel(path, index=False, engine="openpyxl")
         messagebox.showinfo("成功", f"模板已保存到:\n{path}\n\n"
-                            "请按照模板格式填写后再导入。\n"
+                            "请按照模板格式填写后再导入。\n\n"
                             "「平台」列必须为：抖音、快手、小红书、微信视频号 之一\n"
-                            "「ID」列为该平台的用户ID\n"
-                            "「昵称」列可选")
+                            "「ID」列为该平台的平台号（如抖音号），可留空\n"
+                            "「昵称」列为对方昵称\n\n"
+                            "ID 和昵称至少填写一项即可。")
 
     # ── 管理 ──
 

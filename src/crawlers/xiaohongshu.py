@@ -262,9 +262,12 @@ class XiaohongshuCrawler(BaseCrawler):
         ts = (
             note.get("time", 0)
             or note.get("create_time", 0)
+            or note.get("last_update_time", 0)
+            or note.get("timestamp", 0)
             or item.get("time", 0)
+            or item.get("timestamp", 0)
         )
-        pub_date = self._ts_to_str(ts)
+        pub_date = self._ts_to_str(ts) or datetime.now().strftime("%Y-%m-%d %H:%M")
 
         return CrawlResult(
             platform="小红书",

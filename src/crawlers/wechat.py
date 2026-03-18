@@ -268,8 +268,13 @@ class WechatCrawler(BaseCrawler):
 
         link = item.get("shareUrl", "") or item.get("url", "") or ""
 
-        ts = obj.get("createTime", 0) or item.get("createTime", 0)
-        pub_date = self._ts_to_str(ts)
+        ts = (
+            obj.get("createTime", 0)
+            or item.get("createTime", 0)
+            or obj.get("create_time", 0)
+            or obj.get("timestamp", 0)
+        )
+        pub_date = self._ts_to_str(ts) or datetime.now().strftime("%Y-%m-%d %H:%M")
 
         return CrawlResult(
             platform="微信视频号",

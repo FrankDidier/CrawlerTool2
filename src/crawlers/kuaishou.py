@@ -226,8 +226,14 @@ class KuaishouCrawler(BaseCrawler):
             or f"https://www.kuaishou.cn/short-video/{item_id}"
         )
 
-        ts = item.get("timestamp", 0) or item.get("createTime", 0)
-        pub_date = self._ts_to_str(ts)
+        ts = (
+            item.get("timestamp", 0)
+            or item.get("createTime", 0)
+            or photo.get("timestamp", 0)
+            or photo.get("createTime", 0)
+            or photo.get("create_time", 0)
+        )
+        pub_date = self._ts_to_str(ts) or datetime.now().strftime("%Y-%m-%d %H:%M")
 
         return CrawlResult(
             platform="快手",
