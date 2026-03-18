@@ -87,9 +87,23 @@ async def list_users(db_path: Path) -> list[dict]:
     """列出所有用户（仅管理员）"""
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT id, username, role FROM users")
+        cur = await db.execute("SELECT id, username, role, created_at FROM users")
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def delete_user(db_path: Path, username: str) -> tuple[bool, str]:
+    """Delete user (admin cannot delete themselves)."""
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute(
+            "SELECT role FROM users WHERE username = ?", (username,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return False, "用户不存在"
+        await db.execute("DELETE FROM users WHERE username = ?", (username,))
+        await db.commit()
+    return True, "已删除"
 
 
 def can_modify_db(role: str) -> bool:

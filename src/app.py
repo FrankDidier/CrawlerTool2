@@ -30,7 +30,19 @@ from .export_utils import (
 from .llm import sentiment_analyze
 from .notify import send_dingtalk, send_wechat
 
-ROOT = Path(__file__).resolve().parent.parent
+def _get_root() -> Path:
+    """Stable root directory that persists between runs.
+
+    When packaged with PyInstaller, __file__ points to a temporary
+    extraction directory that's deleted on exit.  Use the directory
+    containing the EXE instead so data, config, and cookies survive.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+ROOT = _get_root()
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "crawler.db"
 CONFIG_PATH = ROOT / "config.yaml"
@@ -889,7 +901,7 @@ class MainApp(tk.Frame):
 
     def _do_batch_sentiment(self, cfg, platforms, date_start, date_end,
                             limit, progress_var, win):
-        BATCH = 20
+        BATCH = 50
 
         def do():
             async def _():
@@ -910,8 +922,9 @@ class MainApp(tk.Frame):
                 negative_cnt = 0
                 for start in range(0, total, BATCH):
                     batch = items[start:start + BATCH]
-                    self.after(0, lambda s=start, t=total:
-                               progress_var.set(f"分析中... {s}/{t}"))
+                    self.after(0, lambda s=analyzed, t=total:
+                               progress_var.set(
+                                   f"分析中... {s}/{t}（并发处理，请稍候）"))
                     texts = [r.get("content", "") for r in batch]
                     try:
                         results = await sentiment_analyze(
@@ -934,6 +947,9 @@ class MainApp(tk.Frame):
                                 "remark": results[i].get("remark", ""),
                             })
                             negative_cnt += 1
+                    self.after(0, lambda a=analyzed, t=total, n=negative_cnt:
+                               progress_var.set(
+                                   f"已分析 {a}/{t}，负面 {n} 条"))
 
                 self.after(0, lambda: (
                     progress_var.set(
@@ -1147,16 +1163,53 @@ class MainApp(tk.Frame):
     def _user_mgmt(self):
         win = tk.Toplevel(self)
         win.title("用户管理")
-        tv = ttk.Treeview(win, columns=("用户", "角色"), show="headings", height=10)
-        tv.heading("用户", text="用户")
-        tv.heading("角色", text="角色")
-        users = run_async(auth.list_users(DB_PATH))
-        for u in users:
-            tv.insert("", "end", values=(u["username"], u["role"]))
-        tv.pack(fill="both", expand=True, padx=10, pady=10)
-        ttk.Button(win, text="添加用户", command=lambda: self._add_user_dialog(win)).pack(pady=5)
+        win.geometry("500x400")
 
-    def _add_user_dialog(self, parent):
+        btn_bar = ttk.Frame(win)
+        btn_bar.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Button(btn_bar, text="添加用户", command=lambda: self._add_user_dialog(win, load)).pack(side="left", padx=3)
+        ttk.Button(btn_bar, text="修改密码", command=lambda: self._change_pwd_dialog(win, tv)).pack(side="left", padx=3)
+        ttk.Button(btn_bar, text="删除用户", command=lambda: _delete()).pack(side="left", padx=3)
+        count_lbl = ttk.Label(btn_bar, text="", foreground="gray")
+        count_lbl.pack(side="right", padx=5)
+
+        tv = ttk.Treeview(win, columns=("用户", "角色", "创建时间"), show="headings", height=12)
+        tv.heading("用户", text="用户名")
+        tv.heading("角色", text="角色")
+        tv.heading("创建时间", text="创建时间")
+        tv.column("用户", width=120)
+        tv.column("角色", width=80)
+        tv.column("创建时间", width=160)
+        tv.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        def load():
+            tv.delete(*tv.get_children())
+            users = run_async(auth.list_users(DB_PATH))
+            for u in users:
+                tv.insert("", "end", values=(u["username"], u["role"], u.get("created_at", "")))
+            count_lbl.config(text=f"共 {len(users)} 个用户")
+
+        def _delete():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showwarning("提示", "请先选中要删除的用户", parent=win)
+                return
+            uname = tv.item(sel[0])["values"][0]
+            if uname == self.user["username"]:
+                messagebox.showerror("错误", "不能删除自己", parent=win)
+                return
+            if not messagebox.askyesno("确认", f"确定删除用户「{uname}」？", parent=win):
+                return
+            ok, msg = run_async(auth.delete_user(DB_PATH, uname))
+            if ok:
+                messagebox.showinfo("成功", msg, parent=win)
+                load()
+            else:
+                messagebox.showerror("错误", msg, parent=win)
+
+        load()
+
+    def _add_user_dialog(self, parent, refresh_cb=None):
         win = tk.Toplevel(parent)
         win.title("添加用户")
         ttk.Label(win, text="用户名").pack(anchor="w", padx=10, pady=5)
@@ -1172,15 +1225,45 @@ class MainApp(tk.Frame):
         def save():
             u, p = eu.get().strip(), ep.get()
             if not u or not p:
-                messagebox.showerror("错误", "请输入用户名和密码")
+                messagebox.showerror("错误", "请输入用户名和密码", parent=win)
                 return
             ok, msg = run_async(auth.add_user(DB_PATH, u, p, rv.get()))
             if ok:
-                messagebox.showinfo("成功", msg)
+                messagebox.showinfo("成功", msg, parent=win)
                 win.destroy()
+                if refresh_cb:
+                    refresh_cb()
             else:
-                messagebox.showerror("错误", msg)
+                messagebox.showerror("错误", msg, parent=win)
         ttk.Button(win, text="添加", command=save).pack(pady=10)
+
+    def _change_pwd_dialog(self, parent, tv):
+        sel = tv.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选中要修改密码的用户", parent=parent)
+            return
+        uname = tv.item(sel[0])["values"][0]
+        win = tk.Toplevel(parent)
+        win.title(f"修改密码 - {uname}")
+        ttk.Label(win, text=f"为用户「{uname}」设置新密码：").pack(anchor="w", padx=10, pady=10)
+        ep = ttk.Entry(win, width=25, show="*")
+        ep.pack(padx=10, pady=5, fill="x")
+        ttk.Label(win, text="确认新密码：").pack(anchor="w", padx=10, pady=5)
+        ep2 = ttk.Entry(win, width=25, show="*")
+        ep2.pack(padx=10, pady=5, fill="x")
+
+        def save():
+            p1, p2 = ep.get(), ep2.get()
+            if not p1:
+                messagebox.showerror("错误", "请输入新密码", parent=win)
+                return
+            if p1 != p2:
+                messagebox.showerror("错误", "两次密码不一致", parent=win)
+                return
+            run_async(auth.change_password(DB_PATH, uname, p1))
+            messagebox.showinfo("成功", f"用户「{uname}」密码已修改", parent=win)
+            win.destroy()
+        ttk.Button(win, text="确认修改", command=save).pack(pady=10)
 
     def _clear_db(self):
         if not messagebox.askyesno("确认", "确定清空采集库？此操作不可恢复。"):
