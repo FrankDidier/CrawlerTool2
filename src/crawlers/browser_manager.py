@@ -7,11 +7,14 @@ Each platform gets its own BrowserContext with saved cookies.
 Browser resolution order:
   1. System Google Chrome  (channel="chrome")
   2. System Microsoft Edge (channel="msedge")
-  3. Playwright bundled Chromium (requires `playwright install chromium`)
+  3. Chrome/Edge via explicit executable path (Win10 fallback)
+  4. Playwright bundled Chromium (requires `playwright install chromium`)
 """
 import json
 import asyncio
 import logging
+import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -51,24 +54,73 @@ _CHANNELS = [
 ]
 
 
+def _find_browser_executables() -> list[tuple[str, str]]:
+    """Scan common Windows paths for Chrome/Edge executables.
+
+    Returns list of (executable_path, label) for each browser found.
+    Only relevant on Windows; returns empty list elsewhere.
+    """
+    if sys.platform != "win32":
+        return []
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+         "Chrome (Program Files)"),
+        (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+         "Chrome (x86)"),
+        (os.path.join(local, r"Google\Chrome\Application\chrome.exe") if local else "",
+         "Chrome (LocalAppData)"),
+        (r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+         "Edge (Program Files)"),
+        (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+         "Edge (x86)"),
+    ]
+    found: list[tuple[str, str]] = []
+    for path, label in candidates:
+        if path and os.path.isfile(path):
+            found.append((path, label))
+            logger.debug("Found browser: %s at %s", label, path)
+    return found
+
+
 async def _launch_with_fallback(pw, *, headless: bool):
-    """Try system Chrome → Edge → Playwright Chromium.  Returns a Browser."""
+    """Try system Chrome → Edge → explicit path → Playwright Chromium."""
     errors: list[str] = []
 
+    # 1) Playwright channel-based detection
     for channel, label in _CHANNELS:
         try:
             browser = await pw.chromium.launch(
                 headless=headless, channel=channel, args=LAUNCH_ARGS,
             )
-            logger.info("Launched %s (channel=%s, headless=%s)", label, channel, headless)
+            logger.info("Launched %s (channel=%s, headless=%s)",
+                        label, channel, headless)
             return browser
         except Exception as exc:
             errors.append(f"{label}: {exc}")
             logger.debug("Cannot launch %s: %s", label, exc)
 
+    # 2) Explicit executable paths (Win10 fallback)
+    for exe_path, label in _find_browser_executables():
+        try:
+            browser = await pw.chromium.launch(
+                headless=headless,
+                executable_path=exe_path,
+                args=LAUNCH_ARGS,
+            )
+            logger.info("Launched %s via explicit path (headless=%s)",
+                        label, headless)
+            return browser
+        except Exception as exc:
+            errors.append(f"{label} ({exe_path}): {exc}")
+            logger.debug("Cannot launch %s at %s: %s", label, exe_path, exc)
+
+    # 3) Playwright bundled Chromium
     try:
         browser = await pw.chromium.launch(headless=headless, args=LAUNCH_ARGS)
-        logger.info("Launched Playwright bundled Chromium (headless=%s)", headless)
+        logger.info("Launched Playwright bundled Chromium (headless=%s)",
+                     headless)
         return browser
     except Exception as exc:
         errors.append(f"Playwright Chromium: {exc}")

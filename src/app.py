@@ -894,7 +894,7 @@ class MainApp(tk.Frame):
             return
         win = tk.Toplevel(self)
         win.title("批量分析全部数据")
-        win.geometry("350x100")
+        win.geometry("450x100")
         progress_var = tk.StringVar(value="准备中...")
         ttk.Label(win, textvariable=progress_var).pack(padx=10, pady=20)
         self._do_batch_sentiment(cfg, None, None, None, 0, progress_var, win)
@@ -904,6 +904,8 @@ class MainApp(tk.Frame):
         BATCH = 50
 
         def do():
+            import time as _time
+
             async def _():
                 items = await database.get_unanalyzed_collection(
                     DB_PATH, platforms=platforms,
@@ -918,13 +920,17 @@ class MainApp(tk.Frame):
                     ))
                     return
 
+                t0 = _time.time()
                 analyzed = 0
                 negative_cnt = 0
                 for start in range(0, total, BATCH):
                     batch = items[start:start + BATCH]
-                    self.after(0, lambda s=analyzed, t=total:
+                    elapsed = _time.time() - t0
+                    speed = analyzed / elapsed if elapsed > 1 else 0
+                    eta = (total - analyzed) / speed if speed > 0 else 0
+                    self.after(0, lambda s=analyzed, t=total, e=int(eta):
                                progress_var.set(
-                                   f"分析中... {s}/{t}（并发处理，请稍候）"))
+                                   f"分析中 {s}/{t}（预计剩余 {e} 秒）"))
                     texts = [r.get("content", "") for r in batch]
                     try:
                         results = await sentiment_analyze(
@@ -951,13 +957,16 @@ class MainApp(tk.Frame):
                                progress_var.set(
                                    f"已分析 {a}/{t}，负面 {n} 条"))
 
+                elapsed_total = int(_time.time() - t0)
                 self.after(0, lambda: (
                     progress_var.set(
-                        f"完成！共分析 {analyzed} 条，发现 {negative_cnt} 条负面"),
+                        f"完成！共分析 {analyzed} 条，发现 {negative_cnt} 条负面"
+                        f"（用时 {elapsed_total} 秒）"),
                     messagebox.showinfo(
                         "完成",
                         f"共分析 {analyzed} 条数据\n"
-                        f"发现 {negative_cnt} 条负面言论已存入",
+                        f"发现 {negative_cnt} 条负面言论已存入\n"
+                        f"用时 {elapsed_total} 秒",
                         parent=win,
                     ),
                     self.panel_negative._do_refresh(),
