@@ -8,12 +8,15 @@ Browser resolution order:
   1. System Google Chrome  (channel="chrome")
   2. System Microsoft Edge (channel="msedge")
   3. Chrome/Edge via explicit executable path (Win10 fallback)
-  4. Playwright bundled Chromium (requires `playwright install chromium`)
+  4. Playwright bundled Chromium
+  5. CDP fallback: launch Chrome/Edge via subprocess + connect_over_cdp
 """
 import json
 import asyncio
 import logging
 import os
+import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,41 +57,68 @@ _CHANNELS = [
 ]
 
 
-def _find_browser_executables() -> list[tuple[str, str]]:
-    """Scan common Windows paths for Chrome/Edge executables.
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-    Returns list of (executable_path, label) for each browser found.
-    Only relevant on Windows; returns empty list elsewhere.
-    """
+
+def _find_browser_executables() -> list[tuple[str, str]]:
+    """Find Chrome/Edge on Windows via common paths + registry."""
     if sys.platform != "win32":
         return []
 
+    found: list[tuple[str, str]] = []
     local = os.environ.get("LOCALAPPDATA", "")
+    prog = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    prog86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+
     candidates = [
-        (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-         "Chrome (Program Files)"),
-        (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        (os.path.join(prog, r"Google\Chrome\Application\chrome.exe"),
+         "Chrome"),
+        (os.path.join(prog86, r"Google\Chrome\Application\chrome.exe"),
          "Chrome (x86)"),
-        (os.path.join(local, r"Google\Chrome\Application\chrome.exe") if local else "",
-         "Chrome (LocalAppData)"),
-        (r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-         "Edge (Program Files)"),
-        (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        (os.path.join(local, r"Google\Chrome\Application\chrome.exe")
+         if local else "", "Chrome (User)"),
+        (os.path.join(prog, r"Microsoft\Edge\Application\msedge.exe"),
+         "Edge"),
+        (os.path.join(prog86, r"Microsoft\Edge\Application\msedge.exe"),
          "Edge (x86)"),
     ]
-    found: list[tuple[str, str]] = []
+
     for path, label in candidates:
         if path and os.path.isfile(path):
             found.append((path, label))
-            logger.debug("Found browser: %s at %s", label, path)
+
+    if not found:
+        try:
+            import winreg
+            for sub, lbl in [
+                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                 "Chrome (Registry)"),
+                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+                 "Edge (Registry)"),
+            ]:
+                for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                    try:
+                        with winreg.OpenKey(hive, sub) as key:
+                            val = winreg.QueryValue(key, "")
+                            if val and os.path.isfile(val):
+                                found.append((val, lbl))
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+
+    for path, label in found:
+        logger.debug("Found browser: %s at %s", label, path)
     return found
 
 
 async def _launch_with_fallback(pw, *, headless: bool):
-    """Try system Chrome → Edge → explicit path → Playwright Chromium."""
+    """Try channel → explicit path → bundled Chromium.  Returns Browser."""
     errors: list[str] = []
 
-    # 1) Playwright channel-based detection
     for channel, label in _CHANNELS:
         try:
             browser = await pw.chromium.launch(
@@ -101,34 +131,83 @@ async def _launch_with_fallback(pw, *, headless: bool):
             errors.append(f"{label}: {exc}")
             logger.debug("Cannot launch %s: %s", label, exc)
 
-    # 2) Explicit executable paths (Win10 fallback)
     for exe_path, label in _find_browser_executables():
         try:
             browser = await pw.chromium.launch(
-                headless=headless,
-                executable_path=exe_path,
-                args=LAUNCH_ARGS,
+                headless=headless, executable_path=exe_path, args=LAUNCH_ARGS,
             )
-            logger.info("Launched %s via explicit path (headless=%s)",
-                        label, headless)
+            logger.info("Launched %s via path (headless=%s)", label, headless)
             return browser
         except Exception as exc:
             errors.append(f"{label} ({exe_path}): {exc}")
             logger.debug("Cannot launch %s at %s: %s", label, exe_path, exc)
 
-    # 3) Playwright bundled Chromium
     try:
         browser = await pw.chromium.launch(headless=headless, args=LAUNCH_ARGS)
-        logger.info("Launched Playwright bundled Chromium (headless=%s)",
-                     headless)
+        logger.info("Launched Playwright Chromium (headless=%s)", headless)
         return browser
     except Exception as exc:
         errors.append(f"Playwright Chromium: {exc}")
 
     raise RuntimeError(
-        "无法启动浏览器。请确保系统已安装 Google Chrome 或 Microsoft Edge。\n"
-        "详细错误:\n" + "\n".join(errors)
+        "Playwright launch failed.\n" + "\n".join(errors)
     )
+
+
+async def _launch_via_cdp(pw, *, headless: bool, start_url: str = ""):
+    """Launch Chrome/Edge via subprocess, connect Playwright over CDP.
+
+    This bypasses Playwright's internal launcher entirely — only needs
+    the Chrome binary on the system and Playwright's CDP client.
+    """
+    executables = _find_browser_executables()
+    if not executables:
+        raise RuntimeError("未找到 Chrome 或 Edge 浏览器可执行文件")
+
+    port = _find_free_port()
+    exe_path, label = executables[0]
+
+    cmd = [
+        exe_path,
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    if headless:
+        cmd.append("--headless=new")
+    if start_url:
+        cmd.append(start_url)
+
+    logger.info("CDP launch: %s on port %d (headless=%s)",
+                label, port, headless)
+
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW if headless else 0
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creation_flags,
+    )
+
+    cdp_url = f"http://127.0.0.1:{port}"
+    for attempt in range(15):
+        await asyncio.sleep(1)
+        try:
+            browser = await pw.chromium.connect_over_cdp(cdp_url)
+            logger.info("CDP connected to %s on port %d", label, port)
+            return browser, proc
+        except Exception:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"{label} 进程已退出 (code={proc.returncode})")
+
+    proc.kill()
+    raise RuntimeError(f"无法连接到 {label} CDP (port {port})")
 
 
 class BrowserManager:
@@ -142,6 +221,7 @@ class BrowserManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._pw = None
         self._browser = None
+        self._cdp_proc = None
         self._contexts: dict = {}
         self._pages: dict = {}
         self._start_error: str = ""
@@ -153,21 +233,25 @@ class BrowserManager:
     # ── Browser lifecycle ──
 
     async def start(self):
-        """Initialize Playwright and launch headless browser (Chrome → Edge → Chromium)."""
+        """Initialize Playwright and launch headless browser."""
         from playwright.async_api import async_playwright
 
         if self._pw is None:
             self._pw = await async_playwright().start()
 
         if self._browser is None or not self._browser.is_connected():
-            self._browser = await _launch_with_fallback(self._pw, headless=True)
+            try:
+                self._browser = await _launch_with_fallback(
+                    self._pw, headless=True)
+            except Exception as exc:
+                logger.warning("Standard launch failed, trying CDP: %s", exc)
+                self._browser, self._cdp_proc = await _launch_via_cdp(
+                    self._pw, headless=True)
 
     async def get_page(self, platform: str):
         """Get or create a page for *platform*, reusing across cycles."""
         if not self.is_ready:
-            raise RuntimeError(
-                self._start_error or "Browser not started"
-            )
+            raise RuntimeError(self._start_error or "Browser not started")
 
         if platform in self._pages:
             page = self._pages[platform]
@@ -206,7 +290,8 @@ class BrowserManager:
                 cookies = json.loads(cookie_file.read_text(encoding="utf-8"))
                 if cookies:
                     await context.add_cookies(cookies)
-                    logger.info("[%s] Loaded %d saved cookies", platform, len(cookies))
+                    logger.info("[%s] Loaded %d saved cookies",
+                                platform, len(cookies))
             except Exception as exc:
                 logger.warning("[%s] Cookie load failed: %s", platform, exc)
 
@@ -246,12 +331,9 @@ class BrowserManager:
     # ── Interactive login ──
 
     async def login_interactive(self, platform: str) -> bool:
-        """
-        Open a *visible* browser for the user to log in manually.
-        Uses system Chrome/Edge so no extra download is needed.
-        Cookies are captured periodically while the browser is open.
-        The user closes the browser window when done.
-        Returns True if cookies were obtained.
+        """Open a *visible* browser for the user to log in manually.
+
+        Tries Playwright launch first, falls back to CDP subprocess.
         """
         url = PLATFORM_LOGIN_URLS.get(platform)
         if not url:
@@ -261,8 +343,18 @@ class BrowserManager:
 
         pw = await async_playwright().start()
         saved_cookies: list = []
+        cdp_proc = None
+
         try:
-            browser = await _launch_with_fallback(pw, headless=False)
+            # Try standard launch first, fall back to CDP
+            try:
+                browser = await _launch_with_fallback(pw, headless=False)
+            except Exception as exc:
+                logger.warning("Standard visible launch failed, "
+                               "trying CDP: %s", exc)
+                browser, cdp_proc = await _launch_via_cdp(
+                    pw, headless=False, start_url=url)
+
             context = await browser.new_context(
                 user_agent=UA,
                 viewport={"width": 1280, "height": 720},
@@ -270,9 +362,12 @@ class BrowserManager:
             )
             page = await context.new_page()
             await page.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                "Object.defineProperty(navigator,'webdriver',"
+                "{get:()=>undefined})"
             )
-            await page.goto(url, wait_until="domcontentloaded")
+
+            if not cdp_proc:
+                await page.goto(url, wait_until="domcontentloaded")
 
             done = asyncio.Event()
             page.on("close", lambda _: done.set())
@@ -305,6 +400,11 @@ class BrowserManager:
         except Exception as exc:
             logger.error("[%s] Login browser error: %s", platform, exc)
         finally:
+            if cdp_proc and cdp_proc.poll() is None:
+                try:
+                    cdp_proc.terminate()
+                except Exception:
+                    pass
             try:
                 await pw.stop()
             except Exception:
@@ -324,10 +424,8 @@ class BrowserManager:
             self._pages.pop(platform, None)
 
             is_real = self._has_login_markers(platform, saved_cookies)
-            logger.info(
-                "[%s] Saved %d cookies (login=%s)",
-                platform, len(saved_cookies), is_real,
-            )
+            logger.info("[%s] Saved %d cookies (login=%s)",
+                        platform, len(saved_cookies), is_real)
             return is_real
         return False
 
@@ -367,6 +465,13 @@ class BrowserManager:
             except Exception:
                 pass
             self._browser = None
+
+        if self._cdp_proc and self._cdp_proc.poll() is None:
+            try:
+                self._cdp_proc.terminate()
+            except Exception:
+                pass
+            self._cdp_proc = None
 
         if self._pw:
             try:

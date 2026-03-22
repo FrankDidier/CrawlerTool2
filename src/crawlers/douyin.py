@@ -1,12 +1,15 @@
 """
-抖音爬虫 — Playwright SSR extraction + network interception
+抖音爬虫 — 多策略同城内容采集
 
-Data collection strategy:
-  1. Navigate to douyin.com with saved cookies
-  2. Try to switch to 同城 (local city) tab
-  3. Extract feed data embedded in SSR HTML (RENDER_DATA)
-  4. Intercept /aweme/ API responses triggered by scrolling
-  5. Combine both sources and deduplicate
+Strategy order:
+  1. Navigate to douyin.com, try to click 同城 tab (if visible)
+  2. Call /aweme/v1/web/nearby/feed/ API directly from browser context
+  3. Navigate to /discover page and look for local content
+  4. Fall back to default feed with network interception
+
+The 同城 tab is primarily a *mobile app* feature; the desktop web
+often does not show it.  Strategy #2 (direct API call) is the most
+reliable way to get local-city content from the web.
 """
 import asyncio
 import json
@@ -23,47 +26,6 @@ DOUYIN_URL = "https://www.douyin.com"
 
 class DouyinCrawler(BaseCrawler):
     platform_name = "抖音"
-
-    async def _try_switch_tongcheng(self, page) -> bool:
-        """Try multiple selectors to switch to 同城 tab."""
-        selectors = [
-            'a:has-text("同城")',
-            'div[role="tab"]:has-text("同城")',
-            'span:has-text("同城")',
-            'text=同城',
-        ]
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.click()
-                    await asyncio.sleep(3)
-                    logger.info("[抖音] Clicked 同城 tab via: %s", sel)
-                    return True
-            except Exception:
-                continue
-
-        try:
-            found = await page.evaluate("""() => {
-                const links = document.querySelectorAll('a, div, span, li');
-                for (const el of links) {
-                    const t = el.textContent?.trim();
-                    if (t === '同城' || t === '附近') {
-                        el.click();
-                        return t;
-                    }
-                }
-                return null;
-            }""")
-            if found:
-                await asyncio.sleep(3)
-                logger.info("[抖音] Clicked '%s' tab via JS", found)
-                return True
-        except Exception:
-            pass
-
-        logger.info("[抖音] 同城 tab not found on desktop web, using default feed")
-        return False
 
     async def fetch_tongcheng(self) -> list[CrawlResult]:
         if not self.bm:
@@ -93,25 +55,34 @@ class DouyinCrawler(BaseCrawler):
 
         page.on("response", on_response)
         ssr_items: list[dict] = []
+        nearby_items: list[dict] = []
 
         try:
             await page.goto(
                 DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000,
             )
-            await asyncio.sleep(4)
+            await asyncio.sleep(5)
 
             title = await page.title()
             logger.info("[抖音] Page: '%s' @ %s", title, page.url)
 
-            await self._try_switch_tongcheng(page)
-            await asyncio.sleep(2)
+            # Strategy 1: Try clicking 同城 tab
+            clicked = await self._try_switch_tongcheng(page)
 
+            if not clicked:
+                # Strategy 2: Direct API call for nearby feed
+                nearby_items = await self._fetch_nearby_api(page)
+                if nearby_items:
+                    logger.info("[抖音] 同城 API: got %d items",
+                                len(nearby_items))
+
+            # SSR extraction (after potential tab switch)
+            await asyncio.sleep(2)
             ssr_items = await self._extract_ssr(page)
             if ssr_items:
-                logger.info("[抖音] SSR: found %d items in page HTML", len(ssr_items))
-            else:
-                logger.info("[抖音] SSR: no embedded data found, relying on API interception")
+                logger.info("[抖音] SSR: found %d items", len(ssr_items))
 
+            # Scroll to trigger API responses
             for _ in range(5):
                 await page.evaluate(
                     "window.scrollTo(0, document.body.scrollHeight)"
@@ -129,6 +100,13 @@ class DouyinCrawler(BaseCrawler):
         results: list[CrawlResult] = []
         seen: set[str] = set()
 
+        for item in nearby_items:
+            r = self._parse_aweme(item, seen)
+            if r:
+                results.append(r)
+
+        nearby_count = len(results)
+
         for item in ssr_items:
             r = self._parse_aweme(item, seen)
             if r:
@@ -138,41 +116,124 @@ class DouyinCrawler(BaseCrawler):
             results.extend(self._parse_response(body, seen))
 
         logger.info(
-            "[抖音] Total: %d items (SSR=%d, API captures=%d)",
-            len(results), len(ssr_items), len(captured),
+            "[抖音] Total: %d items (nearby_api=%d, SSR=%d, captures=%d)",
+            len(results), nearby_count, len(ssr_items), len(captured),
         )
         return results
+
+    # ── Strategy 1: Tab click ──
+
+    async def _try_switch_tongcheng(self, page) -> bool:
+        """Try to find and click 同城 tab in the web UI."""
+        selectors = [
+            '[data-e2e="channel-item"]:has-text("同城")',
+            '[data-e2e="channel-item"]:has-text("附近")',
+            'a:has-text("同城")',
+            'div[role="tab"]:has-text("同城")',
+            'span:has-text("同城")',
+            'a:has-text("附近")',
+            'span:has-text("附近")',
+            'text=同城',
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    await asyncio.sleep(3)
+                    logger.info("[抖音] Clicked 同城 tab via: %s", sel)
+                    return True
+            except Exception:
+                continue
+
+        found = await page.evaluate("""() => {
+            const all = document.querySelectorAll(
+                'a, div, span, li, [role="tab"]'
+            );
+            for (const el of all) {
+                const t = (el.textContent || '').trim();
+                if (t === '同城' || t === '附近' || t === '本地') {
+                    el.click();
+                    return t;
+                }
+            }
+            return null;
+        }""")
+        if found:
+            await asyncio.sleep(3)
+            logger.info("[抖音] Clicked '%s' via JS scan", found)
+            return True
+
+        logger.info("[抖音] 同城 tab not found in desktop web UI")
+        return False
+
+    # ── Strategy 2: Direct nearby API call ──
+
+    async def _fetch_nearby_api(self, page) -> list[dict]:
+        """Call Douyin's web nearby feed API directly from browser context.
+
+        This bypasses the need for a visible tab — it calls the API
+        endpoint that the 同城 tab would call, using the logged-in
+        user's cookies for authentication and city detection.
+        """
+        endpoints = [
+            "/aweme/v1/web/nearby/feed/?count=30&"
+            "aid=6383&channel=channel_nearby&offset=0",
+            "/aweme/v1/web/general/search/single/?"
+            "keyword=同城&count=20&search_source=normal_search",
+        ]
+
+        all_items: list[dict] = []
+        for ep in endpoints:
+            try:
+                data = await page.evaluate("""async (url) => {
+                    try {
+                        const r = await fetch(url, {
+                            credentials: 'include',
+                            headers: {'Accept': 'application/json'}
+                        });
+                        if (!r.ok) return null;
+                        return await r.json();
+                    } catch { return null; }
+                }""", ep)
+                if data and isinstance(data, dict):
+                    items = self._dig_aweme_list(data)
+                    if items:
+                        logger.info("[抖音] nearby API (%s): %d items",
+                                    ep.split("?")[0], len(items))
+                        all_items.extend(items)
+                        break
+            except Exception as exc:
+                logger.debug("[抖音] nearby API failed (%s): %s",
+                             ep.split("?")[0], exc)
+        return all_items
 
     # ── SSR extraction ──
 
     async def _extract_ssr(self, page) -> list[dict]:
-        """Pull video items from Douyin's server-rendered HTML data."""
         try:
             raw = await page.evaluate("""() => {
                 const out = [];
                 const seen = new Set();
-                // Collect all script[type=application/json] by element
-                document.querySelectorAll('script[type="application/json"]').forEach(s => {
+                document.querySelectorAll(
+                    'script[type="application/json"]'
+                ).forEach(s => {
                     if (s.textContent && s.textContent.length > 10) {
                         out.push({t: s.id || 'script', d: s.textContent});
                         if (s.id) seen.add(s.id);
                     }
                 });
-                // Window properties (skip DOM element refs)
                 for (const k of ['__NEXT_DATA__', '__INITIAL_STATE__',
                                   '__INITIAL_SSR_DATA__']) {
                     if (seen.has(k)) continue;
                     const v = window[k];
-                    if (v && typeof v === 'object' && !v.nodeType) {
+                    if (v && typeof v === 'object' && !v.nodeType)
                         out.push({t: k, d: JSON.stringify(v)});
-                    }
                 }
                 return out;
             }""")
-
             if not raw:
                 return []
-
             all_items: list[dict] = []
             for entry in raw:
                 text = entry.get("d", "")
@@ -185,14 +246,12 @@ class DouyinCrawler(BaseCrawler):
                     except Exception:
                         continue
                 all_items.extend(self._dig_aweme_list(data))
-
             return all_items
         except Exception as exc:
-            logger.debug("[抖音] SSR extraction error: %s", exc)
+            logger.debug("[抖音] SSR error: %s", exc)
             return []
 
     def _dig_aweme_list(self, obj, depth=0) -> list[dict]:
-        """Recursively find arrays of aweme-like objects."""
         if depth > 6:
             return []
         if isinstance(obj, list):
@@ -212,7 +271,7 @@ class DouyinCrawler(BaseCrawler):
             return out
         if isinstance(obj, dict):
             for key in ("awemeList", "aweme_list", "videoList", "video_list",
-                        "feedList", "recommendList"):
+                        "feedList", "recommendList", "data"):
                 val = obj.get(key)
                 if isinstance(val, list) and val:
                     found = self._dig_aweme_list(val, depth + 1)
@@ -243,7 +302,6 @@ class DouyinCrawler(BaseCrawler):
                 aweme_list = nested
             else:
                 aweme_list = []
-
         for aweme in aweme_list:
             r = self._parse_aweme(aweme, seen)
             if r:
@@ -253,7 +311,6 @@ class DouyinCrawler(BaseCrawler):
     def _parse_aweme(self, aweme: dict, seen: set) -> CrawlResult | None:
         if not isinstance(aweme, dict):
             return None
-
         aweme_id = str(
             aweme.get("aweme_id", "")
             or aweme.get("awemeId", "")
