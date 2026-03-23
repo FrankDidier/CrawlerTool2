@@ -1,21 +1,24 @@
 """
-抖音爬虫 — 多策略同城内容采集
+抖音爬虫 — 城市搜索 + 同城 API + 信息流
 
-Strategy order:
-  1. Navigate to douyin.com, try to click 同城 tab (if visible)
-  2. Call /aweme/v1/web/nearby/feed/ API directly from browser context
-  3. Navigate to /discover page and look for local content
-  4. Fall back to default feed with network interception
+Strategy (when target_city is configured):
+  1. Search "{city} 同城" on douyin.com → city-relevant content
+  2. Call /aweme/v1/web/nearby/feed/ API with cookies
+  3. Extract SSR data + intercept scroll API responses
 
-The 同城 tab is primarily a *mobile app* feature; the desktop web
-often does not show it.  Strategy #2 (direct API call) is the most
-reliable way to get local-city content from the web.
+Without target_city:
+  1. Try clicking 同城 tab (unlikely on desktop web)
+  2. Try nearby API
+  3. Fall back to default feed
+
+The 同城 tab is a mobile-app feature; desktop web doesn't show it.
+City-based search is the most reliable way to get local content.
 """
 import asyncio
 import json
 import logging
 from datetime import datetime
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 
 from .base import BaseCrawler, CrawlResult
 
@@ -54,39 +57,40 @@ class DouyinCrawler(BaseCrawler):
                 pass
 
         page.on("response", on_response)
-        ssr_items: list[dict] = []
+        search_items: list[dict] = []
         nearby_items: list[dict] = []
+        ssr_items: list[dict] = []
 
         try:
-            await page.goto(
-                DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000,
-            )
-            await asyncio.sleep(5)
+            city = self.target_city
 
-            title = await page.title()
-            logger.info("[抖音] Page: '%s' @ %s", title, page.url)
+            if city:
+                # ── Primary: city-based search ──
+                search_items = await self._search_city(page, city)
+                logger.info("[抖音] City search '%s': %d items",
+                            city, len(search_items))
+            else:
+                # No city configured — navigate to main page
+                await page.goto(
+                    DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000)
+                await asyncio.sleep(5)
 
-            # Strategy 1: Try clicking 同城 tab
-            clicked = await self._try_switch_tongcheng(page)
-
-            if not clicked:
-                # Strategy 2: Direct API call for nearby feed
+            # ── Try nearby API (works with or without city) ──
+            if len(search_items) < 10:
                 nearby_items = await self._fetch_nearby_api(page)
                 if nearby_items:
-                    logger.info("[抖音] 同城 API: got %d items",
+                    logger.info("[抖音] Nearby API: %d items",
                                 len(nearby_items))
 
-            # SSR extraction (after potential tab switch)
-            await asyncio.sleep(2)
+            # ── SSR extraction from current page ──
             ssr_items = await self._extract_ssr(page)
             if ssr_items:
-                logger.info("[抖音] SSR: found %d items", len(ssr_items))
+                logger.info("[抖音] SSR: %d items", len(ssr_items))
 
-            # Scroll to trigger API responses
+            # ── Scroll to trigger more API responses ──
             for _ in range(5):
                 await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)"
-                )
+                    "window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
 
@@ -100,12 +104,16 @@ class DouyinCrawler(BaseCrawler):
         results: list[CrawlResult] = []
         seen: set[str] = set()
 
+        for item in search_items:
+            r = self._parse_aweme(item, seen)
+            if r:
+                results.append(r)
+        search_count = len(results)
+
         for item in nearby_items:
             r = self._parse_aweme(item, seen)
             if r:
                 results.append(r)
-
-        nearby_count = len(results)
 
         for item in ssr_items:
             r = self._parse_aweme(item, seen)
@@ -116,74 +124,94 @@ class DouyinCrawler(BaseCrawler):
             results.extend(self._parse_response(body, seen))
 
         logger.info(
-            "[抖音] Total: %d items (nearby_api=%d, SSR=%d, captures=%d)",
-            len(results), nearby_count, len(ssr_items), len(captured),
+            "[抖音] Total: %d (search=%d, nearby=%d, SSR=%d, captured=%d)",
+            len(results), search_count, len(nearby_items),
+            len(ssr_items), len(captured),
         )
         return results
 
-    # ── Strategy 1: Tab click ──
+    # ── Strategy: city-based search ──
 
-    async def _try_switch_tongcheng(self, page) -> bool:
-        """Try to find and click 同城 tab in the web UI."""
-        selectors = [
-            '[data-e2e="channel-item"]:has-text("同城")',
-            '[data-e2e="channel-item"]:has-text("附近")',
-            'a:has-text("同城")',
-            'div[role="tab"]:has-text("同城")',
-            'span:has-text("同城")',
-            'a:has-text("附近")',
-            'span:has-text("附近")',
-            'text=同城',
-        ]
-        for sel in selectors:
+    async def _search_city(self, page, city: str) -> list[dict]:
+        """Navigate to Douyin search and search for city content."""
+        all_items: list[dict] = []
+
+        queries = [f"{city}", f"{city} 同城"]
+        for query in queries:
             try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.click()
-                    await asyncio.sleep(3)
-                    logger.info("[抖音] Clicked 同城 tab via: %s", sel)
-                    return True
-            except Exception:
-                continue
+                search_url = (
+                    f"{DOUYIN_URL}/search/{quote(query)}"
+                    f"?type=video"
+                )
+                await page.goto(
+                    search_url, wait_until="domcontentloaded", timeout=30_000)
+                await asyncio.sleep(4)
 
-        found = await page.evaluate("""() => {
-            const all = document.querySelectorAll(
-                'a, div, span, li, [role="tab"]'
-            );
-            for (const el of all) {
-                const t = (el.textContent || '').trim();
-                if (t === '同城' || t === '附近' || t === '本地') {
-                    el.click();
-                    return t;
-                }
-            }
-            return null;
-        }""")
-        if found:
-            await asyncio.sleep(3)
-            logger.info("[抖音] Clicked '%s' via JS scan", found)
-            return True
+                title = await page.title()
+                logger.info("[抖音] Search page: '%s' @ %s", title, page.url)
 
-        logger.info("[抖音] 同城 tab not found in desktop web UI")
-        return False
+                ssr = await self._extract_ssr(page)
+                if ssr:
+                    all_items.extend(ssr)
+                    logger.info("[抖音] Search '%s' SSR: %d items",
+                                query, len(ssr))
 
-    # ── Strategy 2: Direct nearby API call ──
+                for _ in range(3):
+                    await page.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(2)
+
+                if all_items:
+                    break
+            except Exception as exc:
+                logger.debug("[抖音] Search '%s' error: %s", query, exc)
+
+        # Also try the web search API directly
+        if len(all_items) < 5:
+            for query in queries:
+                try:
+                    api_items = await self._search_api(page, query)
+                    if api_items:
+                        all_items.extend(api_items)
+                        logger.info("[抖音] Search API '%s': %d items",
+                                    query, len(api_items))
+                        break
+                except Exception as exc:
+                    logger.debug("[抖音] Search API '%s' error: %s",
+                                 query, exc)
+
+        return all_items
+
+    async def _search_api(self, page, keyword: str) -> list[dict]:
+        """Call the Douyin web search API from browser context."""
+        encoded = quote(keyword)
+        data = await page.evaluate("""async (kw) => {
+            try {
+                const r = await fetch(
+                    '/aweme/v1/web/general/search/single/'
+                    + '?keyword=' + kw
+                    + '&count=20&search_source=normal_search'
+                    + '&query_correct_type=1&is_filter_search=0'
+                    + '&offset=0&search_id=',
+                    {credentials: 'include',
+                     headers: {'Accept': 'application/json'}}
+                );
+                if (!r.ok) return null;
+                return await r.json();
+            } catch { return null; }
+        }""", encoded)
+        if data and isinstance(data, dict):
+            return self._dig_aweme_list(data)
+        return []
+
+    # ── Strategy: nearby API ──
 
     async def _fetch_nearby_api(self, page) -> list[dict]:
-        """Call Douyin's web nearby feed API directly from browser context.
-
-        This bypasses the need for a visible tab — it calls the API
-        endpoint that the 同城 tab would call, using the logged-in
-        user's cookies for authentication and city detection.
-        """
+        """Call Douyin's web nearby feed API directly."""
         endpoints = [
             "/aweme/v1/web/nearby/feed/?count=30&"
             "aid=6383&channel=channel_nearby&offset=0",
-            "/aweme/v1/web/general/search/single/?"
-            "keyword=同城&count=20&search_source=normal_search",
         ]
-
-        all_items: list[dict] = []
         for ep in endpoints:
             try:
                 data = await page.evaluate("""async (url) => {
@@ -199,14 +227,10 @@ class DouyinCrawler(BaseCrawler):
                 if data and isinstance(data, dict):
                     items = self._dig_aweme_list(data)
                     if items:
-                        logger.info("[抖音] nearby API (%s): %d items",
-                                    ep.split("?")[0], len(items))
-                        all_items.extend(items)
-                        break
+                        return items
             except Exception as exc:
-                logger.debug("[抖音] nearby API failed (%s): %s",
-                             ep.split("?")[0], exc)
-        return all_items
+                logger.debug("[抖音] Nearby API error: %s", exc)
+        return []
 
     # ── SSR extraction ──
 
@@ -284,7 +308,7 @@ class DouyinCrawler(BaseCrawler):
             return out
         return []
 
-    # ── API response parsing ──
+    # ── Response parsing ──
 
     def _parse_response(self, body: dict, seen: set) -> list[CrawlResult]:
         items: list[CrawlResult] = []

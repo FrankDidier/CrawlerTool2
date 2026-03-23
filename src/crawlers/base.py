@@ -24,6 +24,7 @@ class BaseCrawler(ABC):
 
     def __init__(self, browser_manager: "BrowserManager | None" = None):
         self.bm = browser_manager
+        self.target_city: str = ""
 
     @property
     @abstractmethod

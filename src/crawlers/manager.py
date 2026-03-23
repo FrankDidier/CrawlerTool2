@@ -26,9 +26,11 @@ CRAWLERS = {
 
 class CrawlerManager:
     def __init__(self, db_path: Path, platforms: list[str],
-                 data_dir: Path | None = None):
+                 data_dir: Path | None = None, *,
+                 target_city: str = ""):
         self.db_path = db_path
         self.platforms = [p for p in platforms if p in CRAWLERS]
+        self.target_city = target_city
         self._running = False
 
         if data_dir is None:
@@ -46,7 +48,9 @@ class CrawlerManager:
                 self.bm._start_error = str(exc)
                 logger.error("Browser start failed: %s — crawlers will return empty", exc)
             for name in self.platforms:
-                self._crawlers[name] = CRAWLERS[name](self.bm)
+                crawler = CRAWLERS[name](self.bm)
+                crawler.target_city = self.target_city
+                self._crawlers[name] = crawler
 
     async def _run_platform(self, name: str) -> tuple[str, int, int]:
         """Single-platform crawl; returns (name, new_count, dup_count)."""

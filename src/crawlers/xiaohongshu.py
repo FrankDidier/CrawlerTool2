@@ -1,16 +1,20 @@
 """
-小红书爬虫 — Playwright SSR extraction + network interception
+小红书爬虫 — 城市搜索 + 信息流 + 网络拦截
 
-Data collection strategy:
-  1. Navigate to xiaohongshu.com/explore with saved cookies
-  2. Extract SSR data from page HTML (__INITIAL_SSR_DATA__ / __NEXT_DATA__)
-  3. Intercept /api/sns/web/* API responses triggered by scrolling
-  4. Combine and deduplicate
+When target_city is configured:
+  1. Search "{city}" on xiaohongshu.com → city-relevant notes
+  2. Navigate to /explore for general feed
+  3. Intercept /api/sns/web/* for scroll content
+
+Without target_city:
+  1. Navigate to /explore, try 附近/同城 tab
+  2. SSR extraction + API interception
 """
 import asyncio
 import json
 import logging
 from datetime import datetime
+from urllib.parse import quote
 
 from .base import BaseCrawler, CrawlResult
 
@@ -51,12 +55,36 @@ class XiaohongshuCrawler(BaseCrawler):
                 pass
 
         page.on("response", on_response)
+        search_items: list[dict] = []
         ssr_items: list[dict] = []
 
         try:
+            city = self.target_city
+
+            # ── City-based search (when configured) ──
+            if city:
+                search_url = (
+                    f"https://www.xiaohongshu.com/search_result"
+                    f"?keyword={quote(city)}&type=1"
+                )
+                try:
+                    await page.goto(
+                        search_url, wait_until="domcontentloaded",
+                        timeout=30_000)
+                    await asyncio.sleep(4)
+                    search_items = await self._extract_ssr(page)
+                    logger.info("[小红书] City search '%s': %d items",
+                                city, len(search_items))
+                    for _ in range(3):
+                        await page.evaluate(
+                            "window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2)
+                except Exception as exc:
+                    logger.debug("[小红书] Search error: %s", exc)
+
+            # ── Explore page ──
             await page.goto(
-                EXPLORE_URL, wait_until="domcontentloaded", timeout=30_000,
-            )
+                EXPLORE_URL, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(4)
 
             title = await page.title()
@@ -64,55 +92,11 @@ class XiaohongshuCrawler(BaseCrawler):
 
             ssr_items = await self._extract_ssr(page)
             if ssr_items:
-                logger.info("[小红书] SSR: found %d items", len(ssr_items))
-
-            found_local = False
-            for label in ("附近", "同城", "本地"):
-                selectors = [
-                    f'a:has-text("{label}")',
-                    f'div[role="tab"]:has-text("{label}")',
-                    f'span:has-text("{label}")',
-                    f'text={label}',
-                ]
-                for sel in selectors:
-                    try:
-                        tab = page.locator(sel).first
-                        if await tab.is_visible(timeout=2000):
-                            await tab.click()
-                            await asyncio.sleep(3)
-                            logger.info("[小红书] Clicked '%s' tab via %s", label, sel)
-                            found_local = True
-                            break
-                    except Exception:
-                        continue
-                if found_local:
-                    break
-
-            if not found_local:
-                try:
-                    clicked = await page.evaluate("""() => {
-                        const els = document.querySelectorAll('a, div, span, li');
-                        for (const el of els) {
-                            const t = el.textContent?.trim();
-                            if (t === '附近' || t === '同城' || t === '本地') {
-                                el.click();
-                                return t;
-                            }
-                        }
-                        return null;
-                    }""")
-                    if clicked:
-                        await asyncio.sleep(3)
-                        logger.info("[小红书] Clicked '%s' via JS", clicked)
-                    else:
-                        logger.info("[小红书] 附近/同城 tab not found, using default feed")
-                except Exception:
-                    logger.info("[小红书] 附近/同城 tab not found, using default feed")
+                logger.info("[小红书] SSR: %d items", len(ssr_items))
 
             for _ in range(5):
                 await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)"
-                )
+                    "window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
 
@@ -126,6 +110,12 @@ class XiaohongshuCrawler(BaseCrawler):
         results: list[CrawlResult] = []
         seen: set[str] = set()
 
+        for item in search_items:
+            r = self._parse_note(item, seen)
+            if r:
+                results.append(r)
+        search_count = len(results)
+
         for item in ssr_items:
             r = self._parse_note(item, seen)
             if r:
@@ -135,8 +125,8 @@ class XiaohongshuCrawler(BaseCrawler):
             results.extend(self._parse_response(body, seen))
 
         logger.info(
-            "[小红书] Total: %d items (SSR=%d, API captures=%d)",
-            len(results), len(ssr_items), len(captured),
+            "[小红书] Total: %d (search=%d, SSR=%d, captures=%d)",
+            len(results), search_count, len(ssr_items), len(captured),
         )
         return results
 

@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "llm": {"base_url": "https://api.siliconflow.cn/v1", "api_key": "", "model": ""},
     "dingtalk": {"webhook_url": ""},
     "wechat": {"webhook_url": ""},
+    "crawler": {"target_city": ""},
 }
 
 
@@ -535,7 +536,7 @@ class MainApp(tk.Frame):
         """综合设置窗口：平台登录 + 大模型 API + 钉钉 + 微信"""
         win = tk.Toplevel(self)
         win.title("设置")
-        win.geometry("520x650")
+        win.geometry("520x720")
         cfg = load_config()
 
         # --- 平台登录 ---
@@ -561,6 +562,19 @@ class MainApp(tk.Frame):
             def _make_cmd(p=platform, l=lbl, w=win):
                 return lambda: self._login_platform(p, l, w)
             ttk.Button(row, text="登录", command=_make_cmd()).pack(side="right")
+
+        # --- 采集设置 ---
+        lf_crawl = ttk.LabelFrame(win, text="采集设置")
+        lf_crawl.pack(fill="x", padx=10, pady=8)
+        ttk.Label(lf_crawl, text="目标城市").grid(
+            row=0, column=0, sticky="w", padx=5, pady=3)
+        e_city = ttk.Entry(lf_crawl, width=50)
+        e_city.insert(0, cfg.get("crawler", {}).get("target_city", ""))
+        e_city.grid(row=0, column=1, padx=5, pady=3)
+        ttk.Label(lf_crawl,
+                  text="填写后，抖音/快手/小红书将搜索该城市的同城内容",
+                  foreground="gray").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
 
         # --- 大模型 ---
         lf1 = ttk.LabelFrame(win, text="大模型 API（语义判断）")
@@ -657,6 +671,7 @@ class MainApp(tk.Frame):
             }
             cfg["dingtalk"] = {"webhook_url": e_ding.get().strip()}
             cfg["wechat"] = {"webhook_url": e_wx.get().strip()}
+            cfg["crawler"] = {"target_city": e_city.get().strip()}
             save_config(cfg)
             messagebox.showinfo("成功", "设置已保存")
             win.destroy()
@@ -723,7 +738,10 @@ class MainApp(tk.Frame):
             if not messagebox.askyesno("提示", msg):
                 return
 
-        self.crawler_manager = CrawlerManager(DB_PATH, platforms, DATA_DIR)
+        cfg = load_config()
+        target_city = cfg.get("crawler", {}).get("target_city", "")
+        self.crawler_manager = CrawlerManager(
+            DB_PATH, platforms, DATA_DIR, target_city=target_city)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.lbl_status.config(text="采集启动中...")

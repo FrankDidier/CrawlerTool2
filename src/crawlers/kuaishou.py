@@ -1,16 +1,20 @@
 """
-快手爬虫 — Playwright SSR extraction + GraphQL interception
+快手爬虫 — 城市搜索 + 同城页 + GraphQL 拦截
 
-Data collection strategy:
-  1. Navigate to kuaishou.cn (try /samecity, fallback to main feed)
-  2. Extract SSR data from page HTML
-  3. Intercept /graphql responses for scroll-loaded content
-  4. Combine and deduplicate
+When target_city is configured:
+  1. Search "{city}" on kuaishou.cn → city-relevant content
+  2. Navigate to /samecity for local feed
+  3. Intercept /graphql for scroll content
+
+Without target_city:
+  1. Navigate to /samecity (or main feed as fallback)
+  2. SSR extraction + GraphQL interception
 """
 import asyncio
 import json
 import logging
 from datetime import datetime
+from urllib.parse import quote
 
 from .base import BaseCrawler, CrawlResult
 
@@ -50,18 +54,43 @@ class KuaishouCrawler(BaseCrawler):
                 pass
 
         page.on("response", on_response)
+        search_items: list[dict] = []
         ssr_items: list[dict] = []
 
         try:
+            city = self.target_city
+
+            # ── City-based search (when configured) ──
+            if city:
+                search_url = (
+                    f"https://www.kuaishou.cn/search/video"
+                    f"?searchKey={quote(city)}"
+                )
+                try:
+                    await page.goto(
+                        search_url, wait_until="domcontentloaded",
+                        timeout=25_000)
+                    await asyncio.sleep(4)
+                    search_items = await self._extract_ssr(page)
+                    logger.info("[快手] City search '%s': %d items",
+                                city, len(search_items))
+                    for _ in range(3):
+                        await page.evaluate(
+                            "window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2)
+                except Exception as exc:
+                    logger.debug("[快手] Search error: %s", exc)
+
+            # ── Same-city page ──
             try:
                 await page.goto(
-                    SAMECITY_URL, wait_until="domcontentloaded", timeout=25_000,
-                )
+                    SAMECITY_URL, wait_until="domcontentloaded",
+                    timeout=25_000)
             except Exception:
                 logger.info("[快手] samecity unavailable, using main feed")
                 await page.goto(
-                    FALLBACK_URL, wait_until="domcontentloaded", timeout=25_000,
-                )
+                    FALLBACK_URL, wait_until="domcontentloaded",
+                    timeout=25_000)
 
             await asyncio.sleep(3)
             title = await page.title()
@@ -69,12 +98,11 @@ class KuaishouCrawler(BaseCrawler):
 
             ssr_items = await self._extract_ssr(page)
             if ssr_items:
-                logger.info("[快手] SSR: found %d items", len(ssr_items))
+                logger.info("[快手] SSR: %d items", len(ssr_items))
 
             for _ in range(5):
                 await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)"
-                )
+                    "window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
 
@@ -88,6 +116,12 @@ class KuaishouCrawler(BaseCrawler):
         results: list[CrawlResult] = []
         seen: set[str] = set()
 
+        for item in search_items:
+            r = self._parse_item(item, seen)
+            if r:
+                results.append(r)
+        search_count = len(results)
+
         for item in ssr_items:
             r = self._parse_item(item, seen)
             if r:
@@ -97,8 +131,8 @@ class KuaishouCrawler(BaseCrawler):
             results.extend(self._parse_graphql(body, seen))
 
         logger.info(
-            "[快手] Total: %d items (SSR=%d, API captures=%d)",
-            len(results), len(ssr_items), len(captured),
+            "[快手] Total: %d (search=%d, SSR=%d, captures=%d)",
+            len(results), search_count, len(ssr_items), len(captured),
         )
         return results
 
