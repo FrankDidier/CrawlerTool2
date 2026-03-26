@@ -218,7 +218,7 @@ class XiaohongshuCrawler(BaseCrawler):
                 items.append(r)
         return items
 
-    def _parse_note(self, item: dict, seen: set) -> CrawlResult | None:
+    def _parse_note(self, item: dict, seen: set):
         if not isinstance(item, dict):
             return None
 
