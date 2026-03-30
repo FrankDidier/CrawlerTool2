@@ -26,7 +26,7 @@ CRAWLERS = {
 
 class CrawlerManager:
     def __init__(self, db_path: Path, platforms: list[str],
-                 data_dir: Path | None = None, *,
+                 data_dir=None, *,
                  target_city: str = ""):
         self.db_path = db_path
         self.platforms = [p for p in platforms if p in CRAWLERS]

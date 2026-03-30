@@ -252,9 +252,9 @@ async def get_collection_by_ids(db_path: Path, ids: list[int]) -> list[dict]:
 
 async def get_unanalyzed_collection(
     db_path: Path,
-    platforms: list[str] | None = None,
-    date_start: str | None = None,
-    date_end: str | None = None,
+    platforms=None,
+    date_start=None,
+    date_end=None,
     limit: int = 0,
 ) -> list[dict]:
     """Get collection items not yet analyzed for sentiment (not in negative table)."""

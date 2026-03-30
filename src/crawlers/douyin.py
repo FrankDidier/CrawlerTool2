@@ -1,20 +1,22 @@
 """
-抖音爬虫 — 城市搜索 + 信息流
+抖音爬虫 — 主信息流 + 网络拦截
 
-Strategy (when target_city is configured):
-  1. Navigate to douyin.com/search/{city} search page
-  2. Intercept search API responses for city-relevant videos
-  3. Fall back to main feed if search returns nothing
-  4. Scroll to load more content
+Strategy:
+  1. Navigate to douyin.com (main feed — always works)
+  2. Intercept all /aweme/ API responses during page load + scroll
+  3. Parse feed items from intercepted responses
 
-Without target_city:
-  Navigate to main feed, SSR extract + scroll intercept.
+NOTE: Douyin desktop web does not support city-based content (同城).
+The search page is blocked by CAPTCHA for automated browsers, and
+the search API requires security tokens (X-Bogus) that cannot be
+generated outside Douyin's own JS. The main feed returns 推荐/精选
+content based on the logged-in user's IP location and preferences.
 """
 import asyncio
 import json
 import logging
 from datetime import datetime
-from urllib.parse import unquote, quote
+from urllib.parse import unquote
 
 from .base import BaseCrawler, CrawlResult
 
@@ -41,30 +43,40 @@ class DouyinCrawler(BaseCrawler):
             url = response.url
             if response.status != 200:
                 return
-            if not any(k in url for k in (
-                "/aweme/", "/nearby/", "/search/",
-            )):
+            if "/aweme/" not in url:
                 return
             try:
                 ct = response.headers.get("content-type", "")
                 if "json" in ct or "javascript" in ct:
                     body = await response.json()
                     captured.append(body)
-                    logger.debug("[抖音] Captured: %s (%d bytes)",
-                                 url.split("?")[0][-60:],
-                                 len(json.dumps(body, ensure_ascii=False)))
+                    logger.debug("[抖音] Captured: %s",
+                                 url.split("?")[0][-60:])
             except Exception:
                 pass
 
         page.on("response", on_response)
 
         try:
-            city = self.target_city
+            # Always navigate to main page (search triggers CAPTCHA)
+            await page.goto(
+                DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(5)
 
-            if city:
-                await self._do_city_search(page, city)
-            else:
-                await self._do_main_feed(page)
+            title = await page.title()
+            logger.info("[抖音] Page: '%s' @ %s", title, page.url)
+
+            # Also extract SSR data from initial page load
+            ssr_items = await self._extract_ssr(page)
+            if ssr_items:
+                logger.info("[抖音] SSR: %d items", len(ssr_items))
+
+            # Scroll to trigger more feed API calls
+            for _ in range(6):
+                await page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(2.5)
+            await asyncio.sleep(1)
 
         except Exception as exc:
             logger.warning("[抖音] Page error: %s", exc)
@@ -77,6 +89,13 @@ class DouyinCrawler(BaseCrawler):
         results: list[CrawlResult] = []
         seen: set[str] = set()
 
+        # SSR items first
+        for item in (ssr_items if 'ssr_items' in dir() else []):
+            r = self._parse_aweme(item, seen)
+            if r:
+                results.append(r)
+
+        # Network-intercepted API responses
         for body in captured:
             parsed = self._parse_any_response(body, seen)
             results.extend(parsed)
@@ -85,69 +104,63 @@ class DouyinCrawler(BaseCrawler):
                     len(results), len(captured))
         return results
 
-    # ── City search flow ──
+    # ── SSR extraction ──
 
-    async def _do_city_search(self, page, city: str):
-        """Navigate to search page, wait for results to load via API."""
-        search_url = f"{DOUYIN_URL}/search/{quote(city)}?type=video"
-
-        logger.info("[抖音] Navigating to search: %s", search_url)
-        await page.goto(
-            search_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(5)
-
-        title = await page.title()
-        logger.info("[抖音] Search page: '%s' @ %s", title, page.url)
-
-        # Scroll to trigger more search API calls
-        for i in range(5):
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2.5)
-
-        await asyncio.sleep(1)
-
-    # ── Main feed flow (no city) ──
-
-    async def _do_main_feed(self, page):
-        """Navigate to main page, scroll for feed content."""
-        await page.goto(
-            DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(5)
-
-        title = await page.title()
-        logger.info("[抖音] Main page: '%s' @ %s", title, page.url)
-
-        for _ in range(5):
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2)
-        await asyncio.sleep(1)
+    async def _extract_ssr(self, page) -> list[dict]:
+        try:
+            raw = await page.evaluate("""() => {
+                const out = [];
+                const seen = new Set();
+                document.querySelectorAll(
+                    'script[type="application/json"]'
+                ).forEach(s => {
+                    if (s.textContent && s.textContent.length > 10) {
+                        out.push({t: s.id || 'script', d: s.textContent});
+                        if (s.id) seen.add(s.id);
+                    }
+                });
+                for (const k of ['__NEXT_DATA__', '__INITIAL_STATE__',
+                                  '__INITIAL_SSR_DATA__']) {
+                    if (seen.has(k)) continue;
+                    const v = window[k];
+                    if (v && typeof v === 'object' && !v.nodeType)
+                        out.push({t: k, d: JSON.stringify(v)});
+                }
+                return out;
+            }""")
+            if not raw:
+                return []
+            all_items: list[dict] = []
+            for entry in raw:
+                text = entry.get("d", "")
+                try:
+                    decoded = unquote(text)
+                    data = json.loads(decoded)
+                except Exception:
+                    try:
+                        data = json.loads(text)
+                    except Exception:
+                        continue
+                all_items.extend(self._extract_awemes(data))
+            return all_items
+        except Exception as exc:
+            logger.debug("[抖音] SSR error: %s", exc)
+            return []
 
     # ── Universal response parser ──
 
     def _parse_any_response(self, body: dict, seen: set) -> list[CrawlResult]:
-        """Parse any Douyin API response — feed, search, or nearby."""
         if not isinstance(body, dict):
             return []
-
         items: list[CrawlResult] = []
-        awemes = self._extract_awemes(body)
-
-        for aweme in awemes:
+        for aweme in self._extract_awemes(body):
             r = self._parse_aweme(aweme, seen)
             if r:
                 items.append(r)
         return items
 
     def _extract_awemes(self, obj, depth=0) -> list[dict]:
-        """Recursively extract aweme objects from any response format.
-
-        Handles:
-          - Feed: {"aweme_list": [{aweme}, ...]}
-          - Search: {"data": [{"aweme_info": {aweme}}, ...]}
-          - Nested: {"data": {"data": [...]}}
-        """
+        """Recursively extract aweme objects from any response format."""
         if depth > 8:
             return []
 
@@ -156,26 +169,24 @@ class DouyinCrawler(BaseCrawler):
             for item in obj:
                 if not isinstance(item, dict):
                     continue
-                # Search result wrapper: {"type": N, "aweme_info": {...}}
+                # Search result wrapper
                 ai = item.get("aweme_info")
                 if isinstance(ai, dict) and (
                     "aweme_id" in ai or "desc" in ai
                 ):
                     out.append(ai)
                     continue
-                # Direct aweme object
+                # Direct aweme
                 if "aweme_id" in item or "awemeId" in item:
                     out.append(item)
                     continue
                 if "desc" in item and ("author" in item or "nickname" in item):
                     out.append(item)
                     continue
-                # Recurse into nested structures
                 out.extend(self._extract_awemes(item, depth + 1))
             return out
 
         if isinstance(obj, dict):
-            # Check known list keys first
             for key in ("aweme_list", "awemeList", "data", "list",
                         "videoList", "video_list", "feedList",
                         "recommendList"):
@@ -184,7 +195,6 @@ class DouyinCrawler(BaseCrawler):
                     found = self._extract_awemes(val, depth + 1)
                     if found:
                         return found
-            # Recurse into all dict values
             out = []
             for val in obj.values():
                 if isinstance(val, (dict, list)):
