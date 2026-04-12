@@ -27,3 +27,6 @@ pyyaml>=6.0.0
 
 # 反检测 (Anti-detection)
 playwright-stealth>=2.0.0
+
+# Android 模拟器自动化 (可选, 需自行安装 Android SDK + Appium)
+# Appium-Python-Client>=5.0.0

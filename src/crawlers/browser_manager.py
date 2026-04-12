@@ -22,6 +22,7 @@ import json
 import asyncio
 import logging
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -106,6 +107,71 @@ async def apply_stealth(page):
         }
     """)
     return stealth_ok
+
+
+# ═══════════════════════════════════════════════════════════
+#  Human-like behavior utilities
+# ═══════════════════════════════════════════════════════════
+
+_USER_AGENTS = [
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/120.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/121.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/122.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/120.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"),
+]
+
+
+def random_ua() -> str:
+    """Pick a random realistic User-Agent string."""
+    return random.choice(_USER_AGENTS)
+
+
+def random_viewport() -> dict:
+    """Generate a slightly randomized viewport size."""
+    w = random.choice([1280, 1366, 1440, 1536, 1600, 1920])
+    h = random.choice([720, 768, 800, 864, 900, 1080])
+    return {"width": w, "height": h}
+
+
+async def human_scroll(page, times: int = 5, *, jitter: bool = True):
+    """Scroll the page like a human — variable speed and distance."""
+    for _ in range(times):
+        distance = random.randint(300, 900)
+        await page.evaluate(
+            f"window.scrollBy(0, {distance})")
+        delay = random.uniform(1.5, 4.0) if jitter else 2.0
+        await asyncio.sleep(delay)
+
+
+async def human_delay(min_s: float = 1.0, max_s: float = 3.0):
+    """Wait a random human-like duration."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+async def warm_up_page(page, url: str):
+    """Visit the target domain's homepage first to build cookies
+    before navigating to the actual target URL."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    home = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        await page.goto(home, wait_until="domcontentloaded", timeout=15_000)
+        await human_delay(2.0, 4.0)
+        await human_scroll(page, times=2)
+        await human_delay(1.0, 2.0)
+    except Exception as exc:
+        logger.debug("Warm-up navigation error: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -488,8 +554,8 @@ class BrowserManager:
             await self.start()
 
         context = await self._browser.new_context(
-            user_agent=UA,
-            viewport={"width": 1280, "height": 720},
+            user_agent=random_ua(),
+            viewport=random_viewport(),
             locale="zh-CN",
         )
 

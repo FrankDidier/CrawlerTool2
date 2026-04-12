@@ -1,13 +1,14 @@
 """
 抖音爬虫 — 级联反检测策略 + 同城搜索
 
-When target_city is configured, tries 4 anti-detection strategies
+When target_city is configured, tries 5 anti-detection strategies
 in cascade to search for city-specific content on Douyin:
 
   Strategy 1: Standard browser + playwright-stealth → search page
   Strategy 2: Persistent browser profile + stealth → search page
   Strategy 3: Chrome extension capture (headed) → search page
   Strategy 4: User's real Chrome via CDP → search page
+  Strategy 5: Android emulator + Douyin mobile app (Appium)
 
 If all search strategies fail (e.g. CAPTCHA), falls back to main feed
 which always returns 推荐/精选 content.
@@ -21,6 +22,7 @@ from datetime import datetime
 from urllib.parse import quote, unquote
 
 from .base import BaseCrawler, CrawlResult
+from .browser_manager import human_scroll, human_delay, warm_up_page
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,8 @@ class DouyinCrawler(BaseCrawler):
              lambda: self._strategy_extension_search(search_url)),
             ("方案4: 用户Chrome浏览器",
              lambda: self._strategy_cdp_search(search_url)),
+            ("方案5: Android模拟器(Appium)",
+             lambda: self._strategy_emulator(city)),
         ]
 
         for name, fn in strategies:
@@ -143,9 +147,11 @@ class DouyinCrawler(BaseCrawler):
         page.on("response", on_response)
 
         try:
+            await warm_up_page(page, search_url)
+
             await page.goto(
                 search_url, wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(4)
+            await human_delay(3.0, 5.0)
 
             if await self._detect_captcha(page):
                 if wait_for_captcha:
@@ -169,11 +175,8 @@ class DouyinCrawler(BaseCrawler):
             if ssr_items:
                 logger.info("[抖音] SSR: %d items from search", len(ssr_items))
 
-            for _ in range(6):
-                await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(2.5)
-            await asyncio.sleep(1)
+            await human_scroll(page, times=6, jitter=True)
+            await human_delay(1.0, 2.0)
 
         except Exception as exc:
             logger.warning("[抖音] Search page error: %s", exc)
@@ -308,7 +311,41 @@ class DouyinCrawler(BaseCrawler):
                     pass
 
     # ═══════════════════════════════════════════════════
-    #  Strategy 5: Main feed fallback (always works)
+    #  Strategy 5: Android emulator + Douyin mobile app
+    # ═══════════════════════════════════════════════════
+
+    async def _strategy_emulator(self, city: str) -> list[CrawlResult]:
+        """Automate the real Douyin mobile app via Appium + Android emulator.
+
+        The mobile app has a native 同城 tab (unlike the web version).
+        Requires: Android emulator + Appium server + Douyin APK installed.
+        Gracefully returns [] if Appium is not available.
+        """
+        from . import appium_douyin
+
+        if not appium_douyin.is_available():
+            self._notify(
+                "[抖音] 方案5: Appium 未安装，跳过模拟器方案"
+                "（需 pip install Appium-Python-Client）")
+            return []
+
+        raw_items = await appium_douyin.fetch_douyin_tongcheng(
+            city, status_callback=self.status_callback)
+
+        results = []
+        for item in raw_items:
+            results.append(CrawlResult(
+                platform="抖音",
+                item_id=item.get("item_id", ""),
+                nickname=item.get("nickname", ""),
+                content=item.get("content", ""),
+                link=item.get("link", ""),
+                publish_date=item.get("publish_date", ""),
+            ))
+        return results
+
+    # ═══════════════════════════════════════════════════
+    #  Strategy 6: Main feed fallback (always works)
     # ═══════════════════════════════════════════════════
 
     async def _strategy_main_feed(self) -> list[CrawlResult]:
@@ -342,7 +379,7 @@ class DouyinCrawler(BaseCrawler):
         try:
             await page.goto(
                 DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(5)
+            await human_delay(4.0, 6.0)
 
             title = await page.title()
             logger.info("[抖音] Feed page: '%s' @ %s", title, page.url)
@@ -351,11 +388,8 @@ class DouyinCrawler(BaseCrawler):
             if ssr_items:
                 logger.info("[抖音] SSR: %d items", len(ssr_items))
 
-            for _ in range(6):
-                await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(2.5)
-            await asyncio.sleep(1)
+            await human_scroll(page, times=6, jitter=True)
+            await human_delay(1.0, 2.0)
 
         except Exception as exc:
             logger.warning("[抖音] Feed page error: %s", exc)
