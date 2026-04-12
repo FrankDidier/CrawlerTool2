@@ -1367,6 +1367,50 @@ def _show_main(root, user):
     MainApp(root, user).pack(fill="both", expand=True)
 
 
+def _check_browser_availability():
+    """Verify that Chrome or Edge is available on the system.
+
+    Shows a one-time warning if no browser is found — the tool can
+    still run for data viewing/export but crawling will fail.
+    """
+    from .crawlers.browser_manager import _find_browser_executables
+    import shutil
+
+    found_browser = False
+
+    if _find_browser_executables():
+        found_browser = True
+
+    if not found_browser:
+        for cmd in ("google-chrome", "chromium-browser", "chrome", "msedge"):
+            if shutil.which(cmd):
+                found_browser = True
+                break
+
+    if not found_browser:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["playwright", "install", "--help"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                found_browser = True
+        except Exception:
+            pass
+
+    if not found_browser:
+        messagebox.showwarning(
+            "浏览器提示",
+            "未检测到 Google Chrome 或 Microsoft Edge 浏览器。\n\n"
+            "采集功能需要系统中安装以下浏览器之一：\n"
+            "• Google Chrome（推荐）\n"
+            "• Microsoft Edge\n\n"
+            "请安装后重启工具。\n"
+            "其他功能（数据查看、导出等）仍可正常使用。",
+        )
+
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     run_async(database.init_db(DB_PATH))
@@ -1375,6 +1419,8 @@ def main():
     root = tk.Tk()
     root.title("爬虫小工具")
     root.geometry("1050x650")
+
+    _check_browser_availability()
 
     LoginFrame(root, on_success=lambda user: _show_main(root, user)).pack(fill="both", expand=True)
     root.mainloop()

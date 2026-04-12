@@ -5,6 +5,7 @@ data/
 dist/
 build/
 *.spec
+!CrawlerTool.spec
 *.egg-info/
 .eggs/
 config.yaml

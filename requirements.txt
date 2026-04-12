@@ -1,4 +1,4 @@
-# 爬虫小工具 - 依赖清单
+# 爬虫小工具 - 依赖清单 (全部打包进 EXE，用户无需安装)
 # Python 3.10+
 
 # 爬虫与网络
@@ -28,5 +28,5 @@ pyyaml>=6.0.0
 # 反检测 (Anti-detection)
 playwright-stealth>=2.0.0
 
-# Android 模拟器自动化 (可选, 需自行安装 Android SDK + Appium)
-# Appium-Python-Client>=5.0.0
+# Android 模拟器自动化 (已内置，需 Android SDK + Appium 服务端才能生效)
+Appium-Python-Client>=5.0.0
