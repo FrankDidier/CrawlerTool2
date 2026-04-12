@@ -150,9 +150,6 @@ a = Analysis(
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
-    module_collection_mode={
-        'playwright_stealth': 'py+files',
-    },
 )
 
 # ── Collect all data files from packages that have non-Python assets ──
