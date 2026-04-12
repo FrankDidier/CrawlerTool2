@@ -12,14 +12,40 @@ Key packaging concerns:
 
 block_cipher = None
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# ── Collect data files BEFORE Analysis (returns 2-tuples accepted by datas=) ──
+extra_datas = [
+    ('config.example.yaml', '.'),
+]
+extra_datas += collect_data_files('playwright_stealth')
+extra_datas += collect_data_files('tkcalendar')
+extra_datas += collect_data_files('babel')
+extra_datas += collect_data_files('playwright')
+extra_datas += collect_data_files('certifi')
+try:
+    extra_datas += collect_data_files('pydantic')
+    extra_datas += collect_data_files('pydantic_core')
+except Exception:
+    pass
+
+# ── Collect submodules BEFORE Analysis ──
+extra_hiddenimports = []
+extra_hiddenimports += collect_submodules('playwright')
+extra_hiddenimports += collect_submodules('playwright_stealth')
+extra_hiddenimports += collect_submodules('openai')
+try:
+    extra_hiddenimports += collect_submodules('appium')
+    extra_hiddenimports += collect_submodules('selenium')
+except Exception:
+    pass
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('config.example.yaml', '.'),
-    ],
-    hiddenimports=[
+    datas=extra_datas,
+    hiddenimports=extra_hiddenimports + [
         # ── Our application modules ──
         'src',
         'src.app',
@@ -151,43 +177,6 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
-
-# ── Collect all data files from packages that have non-Python assets ──
-from PyInstaller.utils.hooks import (
-    collect_data_files, collect_submodules
-)
-
-# playwright-stealth JS evasion scripts (critical!)
-a.datas += collect_data_files('playwright_stealth')
-
-# tkcalendar themes and locale data
-a.datas += collect_data_files('tkcalendar')
-
-# Babel locale data (required by tkcalendar for date formatting)
-a.datas += collect_data_files('babel')
-
-# Playwright driver (node binary + scripts)
-a.datas += collect_data_files('playwright')
-
-# Certifi CA bundle (for HTTPS requests)
-a.datas += collect_data_files('certifi')
-
-# Pydantic (used by OpenAI SDK, may have compiled validators)
-try:
-    a.datas += collect_data_files('pydantic')
-    a.datas += collect_data_files('pydantic_core')
-except Exception:
-    pass
-
-# Collect all submodules for packages with dynamic imports
-a.hiddenimports += collect_submodules('playwright')
-a.hiddenimports += collect_submodules('playwright_stealth')
-a.hiddenimports += collect_submodules('openai')
-try:
-    a.hiddenimports += collect_submodules('appium')
-    a.hiddenimports += collect_submodules('selenium')
-except Exception:
-    pass
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
