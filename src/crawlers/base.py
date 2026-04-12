@@ -25,6 +25,17 @@ class BaseCrawler(ABC):
     def __init__(self, browser_manager: "BrowserManager | None" = None):
         self.bm = browser_manager
         self.target_city: str = ""
+        self.status_callback = None
+
+    def _notify(self, msg: str):
+        """Send status message to UI and log."""
+        import logging
+        logging.getLogger(__name__).info(msg)
+        if self.status_callback:
+            try:
+                self.status_callback(msg)
+            except Exception:
+                pass
 
     @property
     @abstractmethod

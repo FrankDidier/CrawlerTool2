@@ -572,7 +572,8 @@ class MainApp(tk.Frame):
         e_city.insert(0, cfg.get("crawler", {}).get("target_city", ""))
         e_city.grid(row=0, column=1, padx=5, pady=3)
         ttk.Label(lf_crawl,
-                  text="填写后，抖音/快手/小红书将搜索该城市的同城内容",
+                  text="填写后将自动尝试多种策略搜索该城市同城内容"
+                       "（隐身/持久化/扩展/用户Chrome）",
                   foreground="gray").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
 
@@ -740,8 +741,14 @@ class MainApp(tk.Frame):
 
         cfg = load_config()
         target_city = cfg.get("crawler", {}).get("target_city", "")
+
+        def _status_cb(msg):
+            self.after(0, lambda m=msg: self._on_strategy_status(m))
+
         self.crawler_manager = CrawlerManager(
-            DB_PATH, platforms, DATA_DIR, target_city=target_city)
+            DB_PATH, platforms, DATA_DIR,
+            target_city=target_city,
+            status_callback=_status_cb)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.lbl_status.config(text="采集启动中...")
@@ -808,6 +815,41 @@ class MainApp(tk.Frame):
                 print("\a")
         except Exception:
             print("\a")
+
+    def _on_strategy_status(self, msg: str):
+        """Handle strategy status messages from crawlers."""
+        self.lbl_status.config(text=msg)
+        trigger_words = ("正在尝试", "成功", "出错", "兜底", "验证码",
+                         "未获取", "下一方案")
+        if any(w in msg for w in trigger_words):
+            self._show_strategy_popup(msg)
+
+    def _show_strategy_popup(self, msg: str):
+        """Show a brief auto-closing notification popup."""
+        try:
+            if (hasattr(self, '_strategy_popup')
+                    and self._strategy_popup.winfo_exists()):
+                self._strategy_popup.destroy()
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self)
+        win.title("采集策略通知")
+        win.geometry("460x90")
+        win.attributes('-topmost', True)
+        win.resizable(False, False)
+
+        root_w = self.winfo_toplevel()
+        x = root_w.winfo_x() + root_w.winfo_width() // 2 - 230
+        y = root_w.winfo_y() + 60
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        ttk.Label(win, text=msg, wraplength=440,
+                  justify="center").pack(padx=10, pady=25,
+                                         fill="both", expand=True)
+        self._strategy_popup = win
+        win.after(5000, lambda: win.destroy()
+                  if win.winfo_exists() else None)
 
     def _stop_crawl(self):
         if self.crawler_manager:

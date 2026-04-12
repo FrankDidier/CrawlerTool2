@@ -1,15 +1,22 @@
 """
-Playwright browser management for real web scraping.
+Playwright browser management with cascading anti-detection strategies.
 
-Handles browser lifecycle, cookie persistence, and interactive login.
-Each platform gets its own BrowserContext with saved cookies.
+Handles browser lifecycle, cookie persistence, interactive login,
+and multi-strategy anti-detection for platforms that block automation.
 
-Browser resolution order:
+Browser resolution order (for standard launch):
   1. System Google Chrome  (channel="chrome")
   2. System Microsoft Edge (channel="msedge")
   3. Chrome/Edge via explicit executable path (Win10 fallback)
   4. Playwright bundled Chromium
   5. CDP fallback: launch Chrome/Edge via subprocess + connect_over_cdp
+
+Anti-detection strategies (cascading, for search/CAPTCHA-protected pages):
+  S1. Standard browser + playwright-stealth patches
+  S2. Persistent browser profile + stealth (accumulated state)
+  S3. Persistent profile + Chrome extension capture (headed mode)
+  S4. CDP with user's real Chrome profile (most "human")
+  S5. Main feed fallback (always works, no city-specific content)
 """
 import json
 import asyncio
@@ -57,67 +64,263 @@ _CHANNELS = [
 ]
 
 
+# ═══════════════════════════════════════════════════════════
+#  Anti-detection: Stealth patches
+# ═══════════════════════════════════════════════════════════
+
+async def apply_stealth(page):
+    """Apply anti-detection patches to a Playwright page.
+
+    Uses playwright-stealth if installed, plus manual patches as baseline.
+    """
+    stealth_ok = False
+    try:
+        from playwright_stealth import Stealth
+        s = Stealth()
+        await s.apply_stealth_async(page)
+        stealth_ok = True
+        logger.info("playwright-stealth patches applied")
+    except ImportError:
+        logger.debug("playwright-stealth not installed, using manual patches")
+    except Exception as exc:
+        logger.debug("stealth apply error: %s, using manual patches", exc)
+
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['zh-CN', 'zh', 'en-US', 'en']
+        });
+        if (!window.chrome) window.chrome = {};
+        if (!window.chrome.runtime) window.chrome.runtime = {};
+        const _origPermQ = window.navigator.permissions
+            && window.navigator.permissions.query;
+        if (_origPermQ) {
+            window.navigator.permissions.query = (params) => (
+                params.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : _origPermQ.call(window.navigator.permissions, params)
+            );
+        }
+    """)
+    return stealth_ok
+
+
+# ═══════════════════════════════════════════════════════════
+#  Embedded Chrome Extension for enhanced data capture
+# ═══════════════════════════════════════════════════════════
+
+_EXT_MANIFEST = json.dumps({
+    "manifest_version": 3,
+    "name": "Data Capture Helper",
+    "version": "1.0",
+    "content_scripts": [{
+        "matches": [
+            "*://*.douyin.com/*",
+            "*://*.kuaishou.cn/*",
+            "*://*.xiaohongshu.com/*",
+            "*://channels.weixin.qq.com/*"
+        ],
+        "js": ["content.js"],
+        "run_at": "document_start"
+    }],
+    "web_accessible_resources": [{
+        "resources": ["inject.js"],
+        "matches": ["<all_urls>"]
+    }]
+}, ensure_ascii=False, indent=2)
+
+_EXT_CONTENT_JS = """\
+var s = document.createElement('script');
+s.src = chrome.runtime.getURL('inject.js');
+s.onload = function() { s.remove(); };
+(document.head || document.documentElement).appendChild(s);
+"""
+
+_EXT_INJECT_JS = """\
+(function() {
+    if (window.__CRAWLER_HOOK__) return;
+    window.__CRAWLER_HOOK__ = true;
+    window.__CRAWLER_CAPTURED__ = [];
+
+    var PATTERNS = ['/aweme/', '/graphql', '/api/sns/', '/feed',
+                    '/search/', '/nearby/', '/samecity', '/feedlist'];
+
+    function shouldCapture(url) {
+        for (var i = 0; i < PATTERNS.length; i++) {
+            if (url.indexOf(PATTERNS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    var _fetch = window.fetch;
+    window.fetch = function() {
+        var args = arguments;
+        return _fetch.apply(this, args).then(function(resp) {
+            try {
+                var url = (typeof args[0] === 'string')
+                    ? args[0] : (args[0] && args[0].url) || '';
+                if (shouldCapture(url)) {
+                    resp.clone().json().then(function(data) {
+                        window.__CRAWLER_CAPTURED__.push(
+                            {url: url, data: data, ts: Date.now()});
+                    }).catch(function(){});
+                }
+            } catch(e) {}
+            return resp;
+        });
+    };
+
+    var _xhrOpen = XMLHttpRequest.prototype.open;
+    var _xhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, url) {
+        this.__crawlerUrl = url;
+        return _xhrOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function() {
+        var self = this;
+        this.addEventListener('load', function() {
+            try {
+                var url = self.__crawlerUrl || '';
+                if (shouldCapture(url)) {
+                    var data = JSON.parse(self.responseText);
+                    window.__CRAWLER_CAPTURED__.push(
+                        {url: url, data: data, ts: Date.now()});
+                }
+            } catch(e) {}
+        });
+        return _xhrSend.apply(this, arguments);
+    };
+})();
+"""
+
+
+def _prepare_extension(data_dir: Path) -> Path:
+    """Write the embedded Chrome extension to disk. Returns its directory."""
+    ext_dir = data_dir / "chrome_extension"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    (ext_dir / "manifest.json").write_text(_EXT_MANIFEST, encoding="utf-8")
+    (ext_dir / "content.js").write_text(_EXT_CONTENT_JS, encoding="utf-8")
+    (ext_dir / "inject.js").write_text(_EXT_INJECT_JS, encoding="utf-8")
+    return ext_dir
+
+
+# ═══════════════════════════════════════════════════════════
+#  System browser discovery
+# ═══════════════════════════════════════════════════════════
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def _find_browser_executables() -> list[tuple[str, str]]:
-    """Find Chrome/Edge on Windows via common paths + registry."""
-    if sys.platform != "win32":
-        return []
+def _find_browser_executables() -> list:
+    """Find Chrome/Edge on the current system (Windows, macOS, Linux)."""
+    found = []
 
-    found: list[tuple[str, str]] = []
-    local = os.environ.get("LOCALAPPDATA", "")
-    prog = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-    prog86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        prog = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        prog86 = os.environ.get("PROGRAMFILES(X86)",
+                                r"C:\Program Files (x86)")
+        candidates = [
+            (os.path.join(prog, r"Google\Chrome\Application\chrome.exe"),
+             "Chrome"),
+            (os.path.join(prog86, r"Google\Chrome\Application\chrome.exe"),
+             "Chrome (x86)"),
+            (os.path.join(local, r"Google\Chrome\Application\chrome.exe")
+             if local else "", "Chrome (User)"),
+            (os.path.join(prog, r"Microsoft\Edge\Application\msedge.exe"),
+             "Edge"),
+            (os.path.join(prog86, r"Microsoft\Edge\Application\msedge.exe"),
+             "Edge (x86)"),
+        ]
+        for path, label in candidates:
+            if path and os.path.isfile(path):
+                found.append((path, label))
 
-    candidates = [
-        (os.path.join(prog, r"Google\Chrome\Application\chrome.exe"),
-         "Chrome"),
-        (os.path.join(prog86, r"Google\Chrome\Application\chrome.exe"),
-         "Chrome (x86)"),
-        (os.path.join(local, r"Google\Chrome\Application\chrome.exe")
-         if local else "", "Chrome (User)"),
-        (os.path.join(prog, r"Microsoft\Edge\Application\msedge.exe"),
-         "Edge"),
-        (os.path.join(prog86, r"Microsoft\Edge\Application\msedge.exe"),
-         "Edge (x86)"),
-    ]
+        if not found:
+            try:
+                import winreg
+                for sub, lbl in [
+                    (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                     r"\App Paths\chrome.exe", "Chrome (Registry)"),
+                    (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                     r"\App Paths\msedge.exe", "Edge (Registry)"),
+                ]:
+                    for hive in (winreg.HKEY_LOCAL_MACHINE,
+                                 winreg.HKEY_CURRENT_USER):
+                        try:
+                            with winreg.OpenKey(hive, sub) as key:
+                                val = winreg.QueryValue(key, "")
+                                if val and os.path.isfile(val):
+                                    found.append((val, lbl))
+                        except OSError:
+                            pass
+            except ImportError:
+                pass
 
-    for path, label in candidates:
-        if path and os.path.isfile(path):
-            found.append((path, label))
+    elif sys.platform == "darwin":
+        candidates = [
+            ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+             "Chrome"),
+            ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+             "Edge"),
+            (os.path.expanduser(
+                "~/Applications/Google Chrome.app"
+                "/Contents/MacOS/Google Chrome"), "Chrome (User)"),
+        ]
+        for path, label in candidates:
+            if os.path.isfile(path):
+                found.append((path, label))
 
-    if not found:
-        try:
-            import winreg
-            for sub, lbl in [
-                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-                 "Chrome (Registry)"),
-                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
-                 "Edge (Registry)"),
-            ]:
-                for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                    try:
-                        with winreg.OpenKey(hive, sub) as key:
-                            val = winreg.QueryValue(key, "")
-                            if val and os.path.isfile(val):
-                                found.append((val, lbl))
-                    except OSError:
-                        pass
-        except ImportError:
-            pass
+    else:
+        import shutil
+        for cmd, label in [
+            ("google-chrome", "Chrome"),
+            ("chromium-browser", "Chromium"),
+            ("microsoft-edge", "Edge"),
+        ]:
+            p = shutil.which(cmd)
+            if p:
+                found.append((p, label))
 
     for path, label in found:
         logger.debug("Found browser: %s at %s", label, path)
     return found
 
 
+def _find_chrome_user_data_dir():
+    """Find the default Chrome user data directory on this system."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            p = os.path.join(local, "Google", "Chrome", "User Data")
+            if os.path.isdir(p):
+                return p
+    elif sys.platform == "darwin":
+        p = os.path.expanduser(
+            "~/Library/Application Support/Google/Chrome")
+        if os.path.isdir(p):
+            return p
+    else:
+        for name in ("google-chrome", "chromium"):
+            p = os.path.expanduser(f"~/.config/{name}")
+            if os.path.isdir(p):
+                return p
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Browser launch helpers
+# ═══════════════════════════════════════════════════════════
+
 async def _launch_with_fallback(pw, *, headless: bool):
-    """Try channel → explicit path → bundled Chromium.  Returns Browser."""
-    errors: list[str] = []
+    """Try channel -> explicit path -> bundled Chromium.  Returns Browser."""
+    errors = []
 
     for channel, label in _CHANNELS:
         try:
@@ -155,11 +358,7 @@ async def _launch_with_fallback(pw, *, headless: bool):
 
 
 async def _launch_via_cdp(pw, *, headless: bool, start_url: str = ""):
-    """Launch Chrome/Edge via subprocess, connect Playwright over CDP.
-
-    This bypasses Playwright's internal launcher entirely — only needs
-    the Chrome binary on the system and Playwright's CDP client.
-    """
+    """Launch Chrome/Edge via subprocess, connect Playwright over CDP."""
     executables = _find_browser_executables()
     if not executables:
         raise RuntimeError("未找到 Chrome 或 Edge 浏览器可执行文件")
@@ -210,10 +409,19 @@ async def _launch_via_cdp(pw, *, headless: bool, start_url: str = ""):
     raise RuntimeError(f"无法连接到 {label} CDP (port {port})")
 
 
+# ═══════════════════════════════════════════════════════════
+#  BrowserManager
+# ═══════════════════════════════════════════════════════════
+
 class BrowserManager:
     """
     Manages a shared Playwright Chromium browser for all crawlers.
     Each platform gets its own BrowserContext with persistent cookies.
+
+    Additional methods support anti-detection strategies:
+      - create_stealth_page()       → S1
+      - create_persistent_context() → S2 / S3
+      - create_cdp_user_page()      → S4
     """
 
     def __init__(self, data_dir: Path):
@@ -230,14 +438,16 @@ class BrowserManager:
     def is_ready(self) -> bool:
         return self._browser is not None and self._browser.is_connected()
 
-    # ── Browser lifecycle ──
+    # ── Standard browser lifecycle ──
+
+    async def _ensure_pw(self):
+        if self._pw is None:
+            from playwright.async_api import async_playwright
+            self._pw = await async_playwright().start()
 
     async def start(self):
         """Initialize Playwright and launch headless browser."""
-        from playwright.async_api import async_playwright
-
-        if self._pw is None:
-            self._pw = await async_playwright().start()
+        await self._ensure_pw()
 
         if self._browser is None or not self._browser.is_connected():
             try:
@@ -249,7 +459,8 @@ class BrowserManager:
                     self._pw, headless=True)
 
     async def get_page(self, platform: str):
-        """Get or create a page for *platform*, reusing across cycles."""
+        """Get or create a page for *platform* with stealth, reused across
+        crawl cycles."""
         if not self.is_ready:
             raise RuntimeError(self._start_error or "Browser not started")
 
@@ -264,9 +475,7 @@ class BrowserManager:
 
         ctx = await self._get_context(platform)
         page = await ctx.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+        await apply_stealth(page)
         self._pages[platform] = page
         return page
 
@@ -328,13 +537,200 @@ class BrowserManager:
         safe = platform.replace("/", "_").replace("\\", "_")
         return self.data_dir / f"{safe}_cookies.json"
 
+    # ── Strategy S1: Stealth page from existing browser ──
+
+    async def create_stealth_page(self, platform: str):
+        """Create a new page with full stealth patches.
+
+        Uses the existing browser & context. Caller must close the page
+        when done (page.close()).
+        """
+        if not self.is_ready:
+            await self.start()
+        ctx = await self._get_context(platform)
+        page = await ctx.new_page()
+        await apply_stealth(page)
+        return page
+
+    # ── Strategy S2/S3: Persistent browser context ──
+
+    async def create_persistent_context(self, platform: str, *,
+                                         headless: bool = True,
+                                         extension_path: str = None):
+        """Create a persistent browser context that accumulates state.
+
+        Returns (context, page). Caller must close context when done.
+        If extension_path is given, loads the Chrome extension (forces
+        headed mode since extensions need a visible browser).
+        """
+        await self._ensure_pw()
+
+        profile_dir = (self.data_dir / "profiles"
+                       / platform.replace("/", "_").replace("\\", "_"))
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        args = list(LAUNCH_ARGS)
+        if extension_path:
+            args.extend([
+                f'--disable-extensions-except={extension_path}',
+                f'--load-extension={extension_path}',
+            ])
+            headless = False
+
+        cookie_file = self._cookie_path(platform)
+
+        ctx = None
+        errors = []
+
+        for channel, label in _CHANNELS:
+            try:
+                ctx = await self._pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=headless,
+                    channel=channel,
+                    args=args,
+                    user_agent=UA,
+                    viewport={"width": 1280, "height": 720},
+                    locale="zh-CN",
+                )
+                logger.info("Persistent context via %s (headless=%s, ext=%s)",
+                            label, headless, bool(extension_path))
+                break
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+                logger.debug("Persistent %s failed: %s", label, exc)
+
+        if ctx is None:
+            for exe_path, label in _find_browser_executables():
+                try:
+                    ctx = await self._pw.chromium.launch_persistent_context(
+                        str(profile_dir),
+                        headless=headless,
+                        executable_path=exe_path,
+                        args=args,
+                        user_agent=UA,
+                        viewport={"width": 1280, "height": 720},
+                        locale="zh-CN",
+                    )
+                    logger.info("Persistent context via %s path", label)
+                    break
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+
+        if ctx is None:
+            try:
+                ctx = await self._pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=headless,
+                    args=args,
+                    user_agent=UA,
+                    viewport={"width": 1280, "height": 720},
+                    locale="zh-CN",
+                )
+                logger.info("Persistent context via bundled Chromium")
+            except Exception as exc:
+                errors.append(f"Bundled: {exc}")
+                raise RuntimeError(
+                    "无法创建持久化浏览器:\n" + "\n".join(errors))
+
+        if cookie_file.exists():
+            try:
+                cookies = json.loads(
+                    cookie_file.read_text(encoding="utf-8"))
+                if cookies:
+                    await ctx.add_cookies(cookies)
+            except Exception:
+                pass
+
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await apply_stealth(page)
+        return ctx, page
+
+    # ── Strategy S4: CDP with user's real Chrome profile ──
+
+    async def create_cdp_user_page(self, platform: str):
+        """Launch user's actual Chrome with their real profile via CDP.
+
+        Returns (browser, page, subprocess_proc).
+        Caller must clean up: browser.close() then proc.terminate().
+        """
+        await self._ensure_pw()
+
+        user_data = _find_chrome_user_data_dir()
+        if not user_data:
+            raise RuntimeError(
+                "未找到 Chrome 用户数据目录。"
+                "请确认已安装 Google Chrome 浏览器。")
+
+        executables = _find_browser_executables()
+        if not executables:
+            raise RuntimeError("未找到 Chrome/Edge 浏览器可执行文件")
+
+        port = _find_free_port()
+        exe_path, label = executables[0]
+
+        cmd = [
+            exe_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+        logger.info("CDP user profile: %s, port %d, data=%s",
+                     label, port, user_data)
+
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = 0
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+
+        cdp_url = f"http://127.0.0.1:{port}"
+        browser = None
+        for _ in range(20):
+            await asyncio.sleep(1)
+            try:
+                browser = await self._pw.chromium.connect_over_cdp(cdp_url)
+                logger.info("CDP user profile connected to %s", label)
+                break
+            except Exception:
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        f"{label} 进程已退出 (code={proc.returncode})。"
+                        "可能 Chrome 已在运行中，请先关闭所有 Chrome 窗口再试。")
+
+        if browser is None:
+            proc.kill()
+            raise RuntimeError(
+                f"无法连接到 {label} CDP (port {port})。"
+                "请关闭所有 Chrome 窗口后重试。")
+
+        ctx = (browser.contexts[0] if browser.contexts
+               else await browser.new_context(
+                   user_agent=UA,
+                   viewport={"width": 1280, "height": 720},
+                   locale="zh-CN",
+               ))
+        page = await ctx.new_page()
+        return browser, page, proc
+
+    # ── Chrome extension path ──
+
+    def get_extension_path(self) -> Path:
+        """Get path to the embedded Chrome extension (creates on first call)."""
+        return _prepare_extension(self.data_dir)
+
     # ── Interactive login ──
 
     async def login_interactive(self, platform: str) -> bool:
-        """Open a *visible* browser for the user to log in manually.
-
-        Tries Playwright launch first, falls back to CDP subprocess.
-        """
+        """Open a *visible* browser for the user to log in manually."""
         url = PLATFORM_LOGIN_URLS.get(platform)
         if not url:
             return False
@@ -346,7 +742,6 @@ class BrowserManager:
         cdp_proc = None
 
         try:
-            # Try standard launch first, fall back to CDP
             try:
                 browser = await _launch_with_fallback(pw, headless=False)
             except Exception as exc:
@@ -361,10 +756,7 @@ class BrowserManager:
                 locale="zh-CN",
             )
             page = await context.new_page()
-            await page.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',"
-                "{get:()=>undefined})"
-            )
+            await apply_stealth(page)
 
             if not cdp_proc:
                 await page.goto(url, wait_until="domcontentloaded")
@@ -432,8 +824,7 @@ class BrowserManager:
     # ── Cookie validation ──
 
     @staticmethod
-    def _has_login_markers(platform: str, cookies: list[dict]) -> bool:
-        """Check whether *cookies* contain platform-specific login markers."""
+    def _has_login_markers(platform: str, cookies: list) -> bool:
         markers = _LOGIN_COOKIE_MARKERS.get(platform, ())
         if not markers:
             return bool(cookies)

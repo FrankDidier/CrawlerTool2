@@ -24,3 +24,6 @@ tkcalendar>=1.6.1
 
 # 配置文件
 pyyaml>=6.0.0
+
+# 反检测 (Anti-detection)
+playwright-stealth>=2.0.0

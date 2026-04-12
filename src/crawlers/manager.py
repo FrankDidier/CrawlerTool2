@@ -27,17 +27,18 @@ CRAWLERS = {
 class CrawlerManager:
     def __init__(self, db_path: Path, platforms: list[str],
                  data_dir=None, *,
-                 target_city: str = ""):
+                 target_city: str = "",
+                 status_callback=None):
         self.db_path = db_path
         self.platforms = [p for p in platforms if p in CRAWLERS]
         self.target_city = target_city
+        self.status_callback = status_callback
         self._running = False
 
         if data_dir is None:
             data_dir = db_path.parent
         self.bm = BrowserManager(data_dir)
-        self._crawlers: dict[str, DouyinCrawler | KuaishouCrawler
-                             | XiaohongshuCrawler | WechatCrawler] = {}
+        self._crawlers: dict = {}
 
     async def _ensure_crawlers(self):
         """Initialize browser and create crawler instances (once)."""
@@ -50,6 +51,7 @@ class CrawlerManager:
             for name in self.platforms:
                 crawler = CRAWLERS[name](self.bm)
                 crawler.target_city = self.target_city
+                crawler.status_callback = self.status_callback
                 self._crawlers[name] = crawler
 
     async def _run_platform(self, name: str) -> tuple[str, int, int]:
