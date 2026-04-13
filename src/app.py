@@ -526,6 +526,8 @@ class MainApp(tk.Frame):
         ttk.Button(f4, text="全部导出：负面言论 (Excel)", command=lambda: self._export("negative")).pack(anchor="w", padx=5, pady=5)
         ttk.Button(f4, text="全部导出：关注对象 (Excel)", command=lambda: self._export("watched")).pack(anchor="w", padx=5, pady=5)
         ttk.Button(f4, text="备份数据库", command=self._backup).pack(anchor="w", padx=5, pady=5)
+        ttk.Button(f4, text="导出日志（发送给技术支持排查问题）",
+                   command=self._export_logs).pack(anchor="w", padx=5, pady=5)
         if self.user["role"] == "admin":
             ttk.Button(f4, text="用户管理", command=self._user_mgmt).pack(anchor="w", padx=5, pady=5)
             ttk.Button(f4, text="清空采集库（慎用）", command=self._clear_db).pack(anchor="w", padx=5, pady=5)
@@ -1228,6 +1230,35 @@ class MainApp(tk.Frame):
     def _backup(self):
         path = backup_db(DB_PATH, DATA_DIR / "backups")
         messagebox.showinfo("成功", f"已备份到 {path}")
+
+    def _export_logs(self):
+        """Pack all log files into a zip for sharing with tech support."""
+        import shutil
+        import tempfile
+        from datetime import datetime as _dt
+        log_dir = DATA_DIR / "logs"
+        if not log_dir.exists() or not any(log_dir.iterdir()):
+            messagebox.showwarning("提示", "暂无日志文件")
+            return
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP 压缩包", "*.zip")],
+            initialfile=f"crawler_logs_{_dt.now():%Y%m%d_%H%M%S}",
+            title="保存日志压缩包",
+        )
+        if not dest:
+            return
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp) / "logs"
+                shutil.copytree(log_dir, tmp_path)
+                shutil.make_archive(str(Path(dest).with_suffix("")),
+                                    "zip", tmp, "logs")
+            messagebox.showinfo(
+                "导出成功",
+                f"日志已导出到：\n{dest}\n\n请将此文件发送给技术支持。")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
 
     def _user_mgmt(self):
         win = tk.Toplevel(self)
