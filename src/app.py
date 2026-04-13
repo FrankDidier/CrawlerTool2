@@ -822,7 +822,8 @@ class MainApp(tk.Frame):
         """Handle strategy status messages from crawlers."""
         self.lbl_status.config(text=msg)
         trigger_words = ("正在尝试", "成功", "出错", "兜底", "验证码",
-                         "未获取", "下一方案")
+                         "未获取", "下一方案", "方案2", "未登录",
+                         "弹窗", "浏览器", "切换")
         if any(w in msg for w in trigger_words):
             self._show_strategy_popup(msg)
 
@@ -837,7 +838,7 @@ class MainApp(tk.Frame):
 
         win = tk.Toplevel(self)
         win.title("采集策略通知")
-        win.geometry("460x90")
+        win.geometry("480x120")
         win.attributes('-topmost', True)
         win.resizable(False, False)
 

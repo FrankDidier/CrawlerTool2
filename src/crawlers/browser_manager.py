@@ -597,6 +597,30 @@ class BrowserManager:
         except Exception as exc:
             logger.warning("[%s] Cookie save failed: %s", platform, exc)
 
+    async def invalidate_platform_session(self, platform: str):
+        """Close cached context/pages so the next visit reloads cookies from disk.
+
+        Required after headed-login or any write to the cookie JSON outside
+        this context; otherwise Playwright keeps stale in-memory cookies and
+        headless keeps seeing \"not logged in\" forever.
+        """
+        page = self._pages.pop(platform, None)
+        if page:
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+        ctx = self._contexts.pop(platform, None)
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        if page or ctx:
+            logger.info("[%s] Session invalidated; cookies will reload from disk",
+                        platform)
+
     def has_cookies(self, platform: str) -> bool:
         """Check if saved login cookies exist for *platform*."""
         p = self._cookie_path(platform)

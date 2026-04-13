@@ -287,6 +287,23 @@ class DouyinCrawler(BaseCrawler):
         except Exception as exc:
             logger.debug("[抖音] persist cookies: %s", exc)
 
+    async def _invalidate_shared_session(self) -> None:
+        """Reload cookie file into Playwright on next crawl (see BrowserManager)."""
+        if self.bm:
+            await self.bm.invalidate_platform_session(self.platform_name)
+
+    async def _ssr_user_anonymous(self, page) -> bool:
+        """True if Douyin SSR says user is not logged in (search won't hydrate)."""
+        try:
+            anon = await page.evaluate("""() => {
+                const app = window.SSR_RENDER_DATA && window.SSR_RENDER_DATA.app;
+                if (!app || !app.user) return null;
+                return !app.user.isLogin;
+            }""")
+            return anon is True
+        except Exception:
+            return False
+
     # ═══════════════════════════════════════════════════
     #  Main entry point
     # ═══════════════════════════════════════════════════
@@ -320,7 +337,14 @@ class DouyinCrawler(BaseCrawler):
                         DOUYIN_URL, wait_until="domcontentloaded",
                         timeout=60_000)
                 await human_delay(2.0, 4.0)
-                results = await self._search_city_content(page, city)
+                if await self._ssr_user_anonymous(page):
+                    self._notify(
+                        "[抖音] 首页判定未登录，跳过无头批量搜索。"
+                        "同城采集将走方案2：请留意即将弹出的浏览器并完成验证（通常只需一次）。")
+                    results = []
+                else:
+                    results = await self._search_city_content(
+                        page, city, headless_anon_abort=True)
                 if results:
                     await self.bm.save_cookies(self.platform_name)
                     self._notify(
@@ -378,7 +402,13 @@ class DouyinCrawler(BaseCrawler):
                     DOUYIN_URL, wait_until="domcontentloaded",
                     timeout=60_000)
             await human_delay(2.0, 4.0)
-            results = await self._search_city_content(page, city)
+            if await self._ssr_user_anonymous(page):
+                self._notify(
+                    "[抖音] 方案1：无头环境未识别登录，跳过（将尝试方案2 弹窗浏览器）")
+                results = []
+            else:
+                results = await self._search_city_content(
+                    page, city, headless_anon_abort=True)
             if results:
                 await self.bm.save_cookies(self.platform_name)
                 return results
@@ -404,9 +434,14 @@ class DouyinCrawler(BaseCrawler):
                     DOUYIN_URL, wait_until="domcontentloaded",
                     timeout=60_000)
             await human_delay(2.0, 4.0)
-            results = await self._search_city_content(page, city)
+            if await self._ssr_user_anonymous(page):
+                results = []
+            else:
+                results = await self._search_city_content(
+                    page, city, headless_anon_abort=True)
             if results:
                 await self._persist_ctx_cookies(ctx)
+                await self._invalidate_shared_session()
             return results
         finally:
             try:
@@ -427,13 +462,21 @@ class DouyinCrawler(BaseCrawler):
         """Headed browser for manual CAPTCHA. Saves cookies for next cycle."""
         ctx = None
         try:
+            self._notify(
+                "[抖音] 方案2：正在打开可见浏览器（手机模拟）。"
+                "请在窗口内登录或完成验证；成功后可保存 Cookie，减轻后续轮次操作。")
             ctx, page = await self.bm.create_persistent_context(
                 self.platform_name, headless=False,
                 geo_coords=coords, mobile=True)
             results = await self._search_city_content(
-                page, city, wait_for_captcha=True)
+                page, city, wait_for_captcha=True,
+                headless_anon_abort=False)
             if results:
                 await self._persist_ctx_cookies(ctx)
+                await self._invalidate_shared_session()
+                self._notify(
+                    "[抖音] 已保存登录 Cookie并刷新后台浏览器会话；"
+                    "后续轮次将优先尝试无头采集。")
             return results
         finally:
             if ctx:
@@ -447,7 +490,8 @@ class DouyinCrawler(BaseCrawler):
     # ═══════════════════════════════════════════════════
 
     async def _search_city_content(self, page, city, *,
-                                   wait_for_captcha=False
+                                   wait_for_captcha=False,
+                                   headless_anon_abort: bool = False,
                                    ) -> list[CrawlResult]:
         """Search Douyin for '{city}同城', '{city}生活' etc.
 
@@ -471,6 +515,12 @@ class DouyinCrawler(BaseCrawler):
                 all_results.extend(results)
                 if len(all_results) > prev_n:
                     break
+                if (headless_anon_abort and not results
+                        and await self._ssr_user_anonymous(page)):
+                    self._notify(
+                        "[抖音] 无头搜索确认未登录，停止重复尝试，切换下一方案…")
+                    logger.info("[抖音] headless search aborted (SSR anonymous)")
+                    return all_results
                 await human_delay(1.5, 2.5)
 
             if len(all_results) >= 40:
@@ -508,6 +558,8 @@ class DouyinCrawler(BaseCrawler):
                     search_url, wait_until="domcontentloaded",
                     timeout=60_000)
             await human_delay(3.0, 5.0)
+
+            await self._warn_if_search_not_logged_in(page)
 
             if await self._detect_captcha(page):
                 if wait_for_captcha:
@@ -564,6 +616,26 @@ class DouyinCrawler(BaseCrawler):
     # ═══════════════════════════════════════════════════
     #  CAPTCHA detection
     # ═══════════════════════════════════════════════════
+
+    async def _warn_if_search_not_logged_in(self, page) -> None:
+        """Douyin search only hydrates video list when SSR user is logged in."""
+        try:
+            u = await page.evaluate("""() => {
+                const app = window.SSR_RENDER_DATA && window.SSR_RENDER_DATA.app;
+                if (!app || !app.user) return null;
+                return {
+                    isLogin: !!app.user.isLogin,
+                    statusCode: app.user.statusCode,
+                };
+            }""")
+            if u and u.get("isLogin") is False:
+                code = u.get("statusCode", "?")
+                self._notify(
+                    f"[抖音] 搜索页未识别登录(status={code})。"
+                    "若即将弹出方案2浏览器，请在窗口内登录/验证（与「设置」登录可二选一）。")
+                logger.warning("[抖音] Search page SSR user not logged in: %s", u)
+        except Exception as exc:
+            logger.debug("[抖音] SSR login check: %s", exc)
 
     async def _detect_captcha(self, page) -> bool:
         try:
