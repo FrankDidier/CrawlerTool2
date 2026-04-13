@@ -132,6 +132,17 @@ _USER_AGENTS = [
 ]
 
 
+_MOBILE_DEVICE = {
+    "user_agent": ("Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Mobile Safari/537.36"),
+    "viewport": {"width": 393, "height": 851},
+    "device_scale_factor": 2.75,
+    "is_mobile": True,
+    "has_touch": True,
+}
+
+
 def random_ua() -> str:
     """Pick a random realistic User-Agent string."""
     return random.choice(_USER_AGENTS)
@@ -618,11 +629,53 @@ class BrowserManager:
         await apply_stealth(page)
         return page
 
+    # ── Geolocation context (for 同城 content) ──
+
+    async def create_geo_context(self, platform: str,
+                                  lat: float, lng: float, *,
+                                  mobile: bool = False):
+        """Create a context with geolocation spoofing on the shared browser.
+
+        When mobile=True, emulates a mobile device (viewport, touch, UA).
+        Returns (context, page).
+        """
+        if not self.is_ready:
+            await self.start()
+
+        kwargs = {
+            "locale": "zh-CN",
+            "geolocation": {"latitude": lat, "longitude": lng},
+            "permissions": ["geolocation"],
+        }
+        if mobile:
+            kwargs.update(_MOBILE_DEVICE)
+        else:
+            kwargs["user_agent"] = random_ua()
+            kwargs["viewport"] = random_viewport()
+
+        context = await self._browser.new_context(**kwargs)
+
+        cookie_file = self._cookie_path(platform)
+        if cookie_file.exists():
+            try:
+                cookies = json.loads(
+                    cookie_file.read_text(encoding="utf-8"))
+                if cookies:
+                    await context.add_cookies(cookies)
+            except Exception:
+                pass
+
+        page = await context.new_page()
+        await apply_stealth(page)
+        return context, page
+
     # ── Strategy S2/S3: Persistent browser context ──
 
     async def create_persistent_context(self, platform: str, *,
                                          headless: bool = True,
-                                         extension_path: str = None):
+                                         extension_path: str = None,
+                                         geo_coords: tuple = None,
+                                         mobile: bool = False):
         """Create a persistent browser context that accumulates state.
 
         Returns (context, page). Caller must close context when done.
@@ -643,6 +696,17 @@ class BrowserManager:
             ])
             headless = False
 
+        ctx_kwargs: dict = {"locale": "zh-CN"}
+        if mobile:
+            ctx_kwargs.update(_MOBILE_DEVICE)
+        else:
+            ctx_kwargs["user_agent"] = UA
+            ctx_kwargs["viewport"] = {"width": 1280, "height": 720}
+        if geo_coords:
+            ctx_kwargs["geolocation"] = {
+                "latitude": geo_coords[0], "longitude": geo_coords[1]}
+            ctx_kwargs["permissions"] = ["geolocation"]
+
         cookie_file = self._cookie_path(platform)
 
         ctx = None
@@ -655,12 +719,10 @@ class BrowserManager:
                     headless=headless,
                     channel=channel,
                     args=args,
-                    user_agent=UA,
-                    viewport={"width": 1280, "height": 720},
-                    locale="zh-CN",
+                    **ctx_kwargs,
                 )
-                logger.info("Persistent context via %s (headless=%s, ext=%s)",
-                            label, headless, bool(extension_path))
+                logger.info("Persistent context via %s (headless=%s)",
+                            label, headless)
                 break
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
@@ -674,9 +736,7 @@ class BrowserManager:
                         headless=headless,
                         executable_path=exe_path,
                         args=args,
-                        user_agent=UA,
-                        viewport={"width": 1280, "height": 720},
-                        locale="zh-CN",
+                        **ctx_kwargs,
                     )
                     logger.info("Persistent context via %s path", label)
                     break
@@ -689,9 +749,7 @@ class BrowserManager:
                     str(profile_dir),
                     headless=headless,
                     args=args,
-                    user_agent=UA,
-                    viewport={"width": 1280, "height": 720},
-                    locale="zh-CN",
+                    **ctx_kwargs,
                 )
                 logger.info("Persistent context via bundled Chromium")
             except Exception as exc:

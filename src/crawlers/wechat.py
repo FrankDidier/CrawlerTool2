@@ -49,6 +49,7 @@ class WechatCrawler(BaseCrawler):
                 self._notify(
                     f"[微信视频号] {name} 出错: {exc}，尝试下一方案")
 
+        self._notify("[微信视频号] 所有方案已尝试完毕，本轮未获取到数据")
         return []
 
     async def _strategy_stealth(self) -> list[CrawlResult]:

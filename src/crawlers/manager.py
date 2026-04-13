@@ -1,8 +1,9 @@
 """
-爬虫管理器 — 多平台并行 Playwright 采集
+爬虫管理器 — 多平台顺序 Playwright 采集
 
 Creates a shared BrowserManager, instantiates per-platform crawlers,
-and runs a continuous crawl loop with automatic browser cleanup.
+and runs a continuous crawl loop. Platforms run sequentially to avoid
+shared-browser conflicts and confusing interleaved status messages.
 """
 import asyncio
 import logging
@@ -47,7 +48,8 @@ class CrawlerManager:
                 await self.bm.start()
             except Exception as exc:
                 self.bm._start_error = str(exc)
-                logger.error("Browser start failed: %s — crawlers will return empty", exc)
+                logger.error("Browser start failed: %s — crawlers will "
+                             "return empty", exc)
             for name in self.platforms:
                 crawler = CRAWLERS[name](self.bm)
                 crawler.target_city = self.target_city
@@ -80,26 +82,31 @@ class CrawlerManager:
         return name, new_count, dup_count
 
     async def run_once(self) -> dict[str, tuple[int, int]]:
-        """Execute one round of crawling across all selected platforms."""
+        """Execute one round — platforms run sequentially to avoid
+        shared-browser conflicts and confusing interleaved messages."""
         await self._ensure_crawlers()
-        tasks = [self._run_platform(p) for p in self.platforms]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
         out: dict[str, tuple[int, int]] = {}
-        for i, p in enumerate(self.platforms):
-            r = results[i]
-            if isinstance(r, Exception):
-                logger.error("[%s] Error: %s", p, r)
-                out[p] = (0, 0)
-            else:
-                _, new, dup = r
+        for p in self.platforms:
+            if not self._running:
+                break
+            try:
+                name, new, dup = await self._run_platform(p)
                 out[p] = (new, dup)
+            except Exception as exc:
+                logger.error("[%s] Error: %s", p, exc)
+                out[p] = (0, 0)
         return out
 
     async def run_loop(self, callback=None):
         """Continuous crawl loop — 60 s between rounds, auto-cleanup."""
         self._running = True
+        round_num = 0
         try:
             while self._running:
+                round_num += 1
+                if self.status_callback:
+                    self.status_callback(
+                        f"═══ 第 {round_num} 轮采集开始 ═══")
                 try:
                     stats = await self.run_once()
                     if callback:
@@ -117,7 +124,13 @@ class CrawlerManager:
             await self.cleanup()
 
     async def cleanup(self):
-        """Release all browser resources."""
+        """Release all browser resources including cached sessions."""
+        for crawler in self._crawlers.values():
+            if hasattr(crawler, 'cleanup_session'):
+                try:
+                    await crawler.cleanup_session()
+                except Exception:
+                    pass
         self._crawlers.clear()
         try:
             await self.bm.close()

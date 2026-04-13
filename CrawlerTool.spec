@@ -5,7 +5,6 @@ PyInstaller spec — bundles ALL dependencies so user installs nothing.
 Key packaging concerns:
   - playwright_stealth has 23 JS evasion scripts in js/ that must be included
   - tkcalendar needs Babel locale data
-  - Appium-Python-Client + selenium bundled for mobile emulator strategy
   - All src/ submodules explicitly listed as hidden imports
   - config.example.yaml bundled as a data file
 """
@@ -34,11 +33,6 @@ extra_hiddenimports = []
 extra_hiddenimports += collect_submodules('playwright')
 extra_hiddenimports += collect_submodules('playwright_stealth')
 extra_hiddenimports += collect_submodules('openai')
-try:
-    extra_hiddenimports += collect_submodules('appium')
-    extra_hiddenimports += collect_submodules('selenium')
-except Exception:
-    pass
 
 a = Analysis(
     ['main.py'],
@@ -62,8 +56,6 @@ a = Analysis(
         'src.crawlers.kuaishou',
         'src.crawlers.xiaohongshu',
         'src.crawlers.wechat',
-        'src.crawlers.appium_douyin',
-
         # ── Playwright ──
         'playwright',
         'playwright.async_api',
@@ -84,18 +76,6 @@ a = Analysis(
         'playwright_stealth.stealth',
         'playwright_stealth.context_managers',
         'playwright_stealth.case_insensitive_dict',
-
-        # ── Appium + Selenium (for Android emulator) ──
-        'appium',
-        'appium.webdriver',
-        'appium.options',
-        'appium.options.android',
-        'appium.options.android.uiautomator2',
-        'selenium',
-        'selenium.webdriver',
-        'selenium.webdriver.common',
-        'selenium.webdriver.remote',
-        'selenium.webdriver.remote.webdriver',
 
         # ── Database ──
         'aiosqlite',
