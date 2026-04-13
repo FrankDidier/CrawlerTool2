@@ -12,14 +12,16 @@
   4. 会话缓存 — 验证码只需过一次，后续自动复用 Cookie
 
 策略级联：
-  方案1: 自动搜索（无头浏览器 + 地理位置伪装，全自动）
-  方案2: 手动验证（有头浏览器，用户过一次验证码后自动保存）
-  兜底:  主页信息流（无城市过滤）
+  方案1: 优先使用「设置」里登录的无头会话搜索话题（与登录同源 Cookie）；
+         若无数据且已知城市坐标，再尝试独立 GPS 上下文。
+  方案2: 有头移动端 + 手动过验证码，并写回 Cookie。
+  兜底:  主页推荐流（非同城，仅作样本）
 """
 import asyncio
 import json
 import logging
 from datetime import datetime
+from typing import Optional, Union
 from urllib.parse import quote, unquote
 
 from .base import BaseCrawler, CrawlResult
@@ -37,16 +39,29 @@ CAPTCHA_SELECTORS = (
     '[class*="captcha_container"]',
 )
 
+# 拦截可能与视频列表相关的 XHR（尽量宽松；再按 JSON 解析过滤）
 SEARCH_API_PATTERNS = (
     "/aweme/", "/search/", "/feed/", "/nearby/",
     "/same_city/", "/recommend/", "/tab/",
+    "/general/", "/multi/", "/item_list", "/video/",
+    "/challenge/", "/discover/", "/hotsoon/", "/ies/",
+    "/web/general", "/web/search",
 )
 
-# 搜索词模板（按优先级排列）
+# 搜索词模板（按优先级排列；多词提高命中率）
 SEARCH_TEMPLATES = [
     "{city}同城",
     "{city}生活",
+    "{city}探店",
+    "{city}美食",
+    "{city}本地",
 ]
+
+# 搜索页域名（先主站，再移动站；部分网络环境下其一更稳定）
+SEARCH_BASE_URLS = (
+    "https://www.douyin.com/search/",
+    "https://m.douyin.com/search/",
+)
 
 # GPS 坐标（可选，用于辅助地理位置伪装）
 CITY_COORDS = {
@@ -226,21 +241,51 @@ def _get_city_coords(city: str):
     return None
 
 
+async def _response_to_json(response) -> Optional[Union[dict, list]]:
+    """Parse JSON body regardless of Content-Type (Douyin often omits json)."""
+    try:
+        st = response.status
+        if st < 200 or st >= 400:
+            return None
+    except Exception:
+        return None
+    try:
+        data = await response.json()
+        if isinstance(data, (dict, list)):
+            return data
+    except Exception:
+        pass
+    try:
+        text = (await response.text()).strip()
+        if len(text) < 2 or text[0] not in "{[":
+            return None
+        data = json.loads(text)
+        if isinstance(data, (dict, list)):
+            return data
+    except Exception:
+        pass
+    return None
+
+
 class DouyinCrawler(BaseCrawler):
     platform_name = "抖音"
 
     def __init__(self, browser_manager=None):
         super().__init__(browser_manager)
-        self._session_ctx = None
 
     async def cleanup_session(self):
-        """Release cached browser context."""
-        if self._session_ctx:
-            try:
-                await self._session_ctx.close()
-            except Exception:
-                pass
-            self._session_ctx = None
+        """No long-lived context to hold (search uses short-lived pages)."""
+        pass
+
+    async def _persist_ctx_cookies(self, ctx) -> None:
+        try:
+            cookies = await ctx.cookies()
+            if cookies and self.bm:
+                self.bm._cookie_path(self.platform_name).write_text(
+                    json.dumps(cookies, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+        except Exception as exc:
+            logger.debug("[抖音] persist cookies: %s", exc)
 
     # ═══════════════════════════════════════════════════
     #  Main entry point
@@ -257,27 +302,37 @@ class DouyinCrawler(BaseCrawler):
 
         coords = _get_city_coords(city)
 
-        # ── Reuse cached context (cookies survive across cycles) ──
-        if self._session_ctx:
+        if not self.bm.has_cookies(self.platform_name):
+            self._notify(
+                "[抖音] 未检测到有效登录 Cookie，搜索大概率无结果；"
+                "请先在「设置」中登录抖音后再采集")
+
+        # ── 复用与「设置」登录相同的浏览器上下文（Cookie 已注入）──
+        try:
+            self._notify("[抖音] 复用已登录会话，尝试同城搜索...")
+            page = await self.bm.create_stealth_page(self.platform_name)
             try:
-                self._notify("[抖音] 复用已有会话，搜索同城内容...")
-                page = await self._session_ctx.new_page()
-                await apply_stealth(page)
                 try:
-                    results = await self._search_city_content(page, city)
-                finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    await page.goto(
+                        DOUYIN_URL, wait_until="load", timeout=60_000)
+                except Exception:
+                    await page.goto(
+                        DOUYIN_URL, wait_until="domcontentloaded",
+                        timeout=60_000)
+                await human_delay(2.0, 4.0)
+                results = await self._search_city_content(page, city)
                 if results:
+                    await self.bm.save_cookies(self.platform_name)
                     self._notify(
                         f"[抖音] 复用会话成功！获取 {len(results)} 条同城内容")
                     return results
-                self._notify("[抖音] 复用会话未获取到新数据，重新创建...")
-            except Exception as exc:
-                logger.warning("[抖音] Session reuse error: %s", exc)
-            await self.cleanup_session()
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[抖音] Session reuse error: %s", exc)
 
         # ── Cascade strategies ──
         strategies = [
@@ -302,7 +357,8 @@ class DouyinCrawler(BaseCrawler):
                 self._notify(
                     f"[抖音] {name} 出错: {exc}，准备尝试下一方案")
 
-        self._notify("[抖音] 同城方案均未成功，使用主页信息流兜底采集")
+        self._notify(
+            "[抖音] 同城方案均未成功，改用主页推荐流兜底（非同城，仅作样本）")
         return await self._strategy_main_feed()
 
     # ═══════════════════════════════════════════════════
@@ -311,34 +367,56 @@ class DouyinCrawler(BaseCrawler):
 
     async def _strategy_search_headless(self, city, coords
                                         ) -> list[CrawlResult]:
-        """Headless browser search for city hashtags. Fully automatic."""
-        await self.cleanup_session()
-
-        if coords:
-            ctx, page = await self.bm.create_geo_context(
-                self.platform_name, coords[0], coords[1])
-        else:
-            page = await self.bm.create_stealth_page(self.platform_name)
-            ctx = None
-
+        """先使用与登录相同的上下文（无头）；失败再用独立 GPS 上下文。"""
+        page = await self.bm.create_stealth_page(self.platform_name)
         try:
+            try:
+                await page.goto(
+                    DOUYIN_URL, wait_until="load", timeout=60_000)
+            except Exception:
+                await page.goto(
+                    DOUYIN_URL, wait_until="domcontentloaded",
+                    timeout=60_000)
+            await human_delay(2.0, 4.0)
             results = await self._search_city_content(page, city)
+            if results:
+                await self.bm.save_cookies(self.platform_name)
+                return results
         finally:
             try:
                 await page.close()
             except Exception:
                 pass
 
-        if results and ctx:
-            self._session_ctx = ctx
-            self._save_cookies_from_ctx(ctx)
-        elif ctx:
+        if not coords:
+            logger.info(
+                "[抖音] 方案1：共享上下文无数据且无 GPS 坐标，跳过地理上下文")
+            return []
+
+        ctx, page = await self.bm.create_geo_context(
+            self.platform_name, coords[0], coords[1])
+        try:
+            try:
+                await page.goto(
+                    DOUYIN_URL, wait_until="load", timeout=60_000)
+            except Exception:
+                await page.goto(
+                    DOUYIN_URL, wait_until="domcontentloaded",
+                    timeout=60_000)
+            await human_delay(2.0, 4.0)
+            results = await self._search_city_content(page, city)
+            if results:
+                await self._persist_ctx_cookies(ctx)
+            return results
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
             try:
                 await ctx.close()
             except Exception:
                 pass
-
-        return results
 
     # ═══════════════════════════════════════════════════
     #  S2: Search headed (manual CAPTCHA)
@@ -355,7 +433,7 @@ class DouyinCrawler(BaseCrawler):
             results = await self._search_city_content(
                 page, city, wait_for_captcha=True)
             if results:
-                self._save_cookies_from_ctx(ctx)
+                await self._persist_ctx_cookies(ctx)
             return results
         finally:
             if ctx:
@@ -382,16 +460,18 @@ class DouyinCrawler(BaseCrawler):
 
         for template in SEARCH_TEMPLATES:
             term = template.format(city=city)
-            search_url = (
-                f"https://www.douyin.com/search/{quote(term)}"
-                f"?type=video"
-            )
             self._notify(f"[抖音] 搜索「{term}」...")
+            prev_n = len(all_results)
 
-            results = await self._do_search_page(
-                page, search_url, seen,
-                wait_for_captcha=wait_for_captcha)
-            all_results.extend(results)
+            for base in SEARCH_BASE_URLS:
+                search_url = f"{base}{quote(term)}?type=video"
+                results = await self._do_search_page(
+                    page, search_url, seen,
+                    wait_for_captcha=wait_for_captcha)
+                all_results.extend(results)
+                if len(all_results) > prev_n:
+                    break
+                await human_delay(1.5, 2.5)
 
             if len(all_results) >= 40:
                 break
@@ -409,26 +489,24 @@ class DouyinCrawler(BaseCrawler):
         captured = []
 
         async def on_response(response):
-            if response.status != 200:
-                return
             url = response.url
             if not any(p in url for p in SEARCH_API_PATTERNS):
                 return
-            try:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct or "javascript" in ct:
-                    body = await response.json()
-                    captured.append(body)
-                    logger.debug("[抖音] API: %s",
-                                 url.split("?")[0][-60:])
-            except Exception:
-                pass
+            body = await _response_to_json(response)
+            if body is not None:
+                captured.append(body)
+                logger.debug("[抖音] API: %s", url.split("?")[0][-80:])
 
         page.on("response", on_response)
 
         try:
-            await page.goto(
-                search_url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.goto(
+                    search_url, wait_until="load", timeout=60_000)
+            except Exception:
+                await page.goto(
+                    search_url, wait_until="domcontentloaded",
+                    timeout=60_000)
             await human_delay(3.0, 5.0)
 
             if await self._detect_captcha(page):
@@ -441,10 +519,15 @@ class DouyinCrawler(BaseCrawler):
                         if not await self._detect_captcha(page):
                             self._notify("[抖音] 验证已通过！继续采集...")
                             await human_delay(2, 4)
-                            await page.goto(
-                                search_url,
-                                wait_until="domcontentloaded",
-                                timeout=30_000)
+                            try:
+                                await page.goto(
+                                    search_url, wait_until="load",
+                                    timeout=60_000)
+                            except Exception:
+                                await page.goto(
+                                    search_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=60_000)
                             await human_delay(3, 5)
                             break
                     else:
@@ -470,6 +553,12 @@ class DouyinCrawler(BaseCrawler):
                 results.append(r)
         for body in captured:
             results.extend(self._parse_any_response(body, seen))
+
+        if not results:
+            logger.warning(
+                "[抖音] 搜索页未解析到视频: url=%s captured=%d ssr=%d",
+                search_url[:120], len(captured), len(ssr_items))
+
         return results
 
     # ═══════════════════════════════════════════════════
@@ -490,29 +579,6 @@ class DouyinCrawler(BaseCrawler):
         except Exception:
             return False
 
-    # ═══════════════════════════════════════════════════
-    #  Cookie persistence
-    # ═══════════════════════════════════════════════════
-
-    def _save_cookies_from_ctx(self, ctx):
-        """Best-effort sync cookie save (fire and forget)."""
-        import asyncio as _aio
-        async def _save():
-            try:
-                cookies = await ctx.cookies()
-                if cookies and self.bm:
-                    self.bm._cookie_path(self.platform_name).write_text(
-                        json.dumps(cookies, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-            except Exception:
-                pass
-        try:
-            loop = _aio.get_running_loop()
-            loop.create_task(_save())
-        except Exception:
-            pass
-
-    # ═══════════════════════════════════════════════════
     #  Fallback: Main feed
     # ═══════════════════════════════════════════════════
 
@@ -526,21 +592,21 @@ class DouyinCrawler(BaseCrawler):
         captured: list = []
 
         async def on_response(response):
-            if response.status != 200:
-                return
             if "/aweme/" not in response.url:
                 return
-            try:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct or "javascript" in ct:
-                    captured.append(await response.json())
-            except Exception:
-                pass
+            body = await _response_to_json(response)
+            if body is not None:
+                captured.append(body)
 
         page.on("response", on_response)
         try:
-            await page.goto(
-                DOUYIN_URL, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.goto(
+                    DOUYIN_URL, wait_until="load", timeout=60_000)
+            except Exception:
+                await page.goto(
+                    DOUYIN_URL, wait_until="domcontentloaded",
+                    timeout=60_000)
             await human_delay(4.0, 6.0)
             ssr_items = await self._extract_ssr(page)
             await human_scroll(page, times=6, jitter=True)
@@ -609,7 +675,10 @@ class DouyinCrawler(BaseCrawler):
 
     # ── Response parsers (unchanged) ──
 
-    def _parse_any_response(self, body: dict, seen: set) -> list[CrawlResult]:
+    def _parse_any_response(self, body, seen: set) -> list[CrawlResult]:
+        if isinstance(body, list):
+            return [r for aweme in self._extract_awemes(body)
+                    if (r := self._parse_aweme(aweme, seen))]
         if not isinstance(body, dict):
             return []
         return [r for aweme in self._extract_awemes(body)
@@ -640,9 +709,13 @@ class DouyinCrawler(BaseCrawler):
                 out.extend(self._extract_awemes(item, depth + 1))
             return out
         if isinstance(obj, dict):
-            for key in ("aweme_list", "awemeList", "data", "list",
-                        "videoList", "video_list", "feedList",
-                        "recommendList"):
+            for key in (
+                "aweme_list", "awemeList", "search_item_list",
+                "searchItemList", "data", "list", "results",
+                "itemList", "items", "cards", "data_list",
+                "videoList", "video_list", "feedList",
+                "recommendList", "mix_list", "mixList",
+            ):
                 val = obj.get(key)
                 if isinstance(val, list) and val:
                     found = self._extract_awemes(val, depth + 1)
@@ -661,8 +734,17 @@ class DouyinCrawler(BaseCrawler):
         aweme_id = str(
             aweme.get("aweme_id", "")
             or aweme.get("awemeId", "")
+            or aweme.get("itemId", "")
+            or aweme.get("item_id", "")
             or aweme.get("id", "")
         )
+        if not aweme_id:
+            video = aweme.get("video")
+            if isinstance(video, dict):
+                aweme_id = str(
+                    video.get("aweme_id", "")
+                    or video.get("awemeId", "")
+                    or "")
         if not aweme_id or aweme_id in seen:
             return None
         seen.add(aweme_id)
@@ -671,7 +753,7 @@ class DouyinCrawler(BaseCrawler):
         nickname = author.get("nickname", "") or author.get("name", "")
         content = aweme.get("desc", "") or aweme.get("title", "") or ""
         if not content and not nickname:
-            return None
+            content = "(无文案)"
 
         share_url = (
             aweme.get("share_url", "")
