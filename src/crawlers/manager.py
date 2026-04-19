@@ -5,6 +5,8 @@ Creates a shared BrowserManager, instantiates per-platform crawlers,
 and runs a continuous crawl loop. Platforms run sequentially to avoid
 shared-browser conflicts and confusing interleaved status messages.
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 from pathlib import Path

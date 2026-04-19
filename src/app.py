@@ -65,11 +65,24 @@ def _is_trial_token(token: str) -> bool:
 
 
 def load_config():
+    """Load config from YAML, merging with defaults for missing keys."""
     import yaml
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or DEFAULT_CONFIG
-    return DEFAULT_CONFIG
+            user_cfg = yaml.safe_load(f) or {}
+        merged = dict(DEFAULT_CONFIG)
+        for key, default_val in DEFAULT_CONFIG.items():
+            if key not in user_cfg:
+                merged[key] = default_val
+            elif isinstance(default_val, dict):
+                merged[key] = {**default_val, **user_cfg[key]}
+            else:
+                merged[key] = user_cfg[key]
+        for key in user_cfg:
+            if key not in merged:
+                merged[key] = user_cfg[key]
+        return merged
+    return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
