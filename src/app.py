@@ -47,12 +47,21 @@ DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "crawler.db"
 CONFIG_PATH = ROOT / "config.yaml"
 
+TRIAL_API_TOKEN = (
+    "kIkrEc8N6wag3TWSWJDI+0zXKTSuWLV8wBvVmkSgd8KTqViWNlKSWGO8HQ=="
+)
+
 DEFAULT_CONFIG = {
     "llm": {"base_url": "https://api.siliconflow.cn/v1", "api_key": "", "model": ""},
     "dingtalk": {"webhook_url": ""},
     "wechat": {"webhook_url": ""},
     "crawler": {"target_city": ""},
+    "douyin_api": {"token": TRIAL_API_TOKEN, "base_url": "https://api.tikhub.io"},
 }
+
+
+def _is_trial_token(token: str) -> bool:
+    return token.strip() == TRIAL_API_TOKEN
 
 
 def load_config():
@@ -538,7 +547,7 @@ class MainApp(tk.Frame):
         """综合设置窗口：平台登录 + 大模型 API + 钉钉 + 微信"""
         win = tk.Toplevel(self)
         win.title("设置")
-        win.geometry("520x720")
+        win.geometry("540x950")
         cfg = load_config()
 
         # --- 平台登录 ---
@@ -578,6 +587,108 @@ class MainApp(tk.Frame):
                        "（隐身/持久化/扩展/用户Chrome）",
                   foreground="gray").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
+
+        # --- 抖音同城 API ---
+        lf_api = ttk.LabelFrame(win, text="抖音同城 API（★ 真实同城数据）")
+        lf_api.pack(fill="x", padx=10, pady=8)
+
+        cur_token = cfg.get("douyin_api", {}).get("token", "")
+        is_trial = _is_trial_token(cur_token)
+
+        api_status_frame = ttk.Frame(lf_api)
+        api_status_frame.grid(row=0, column=0, columnspan=2,
+                              sticky="w", padx=5, pady=2)
+        if is_trial:
+            _init_status = "当前状态: 试用 Token（额度有限，建议注册自己的账号）"
+            _init_color = "orange"
+        elif cur_token.strip():
+            _init_status = "当前状态: 个人 Token"
+            _init_color = "green"
+        else:
+            _init_status = "当前状态: 未配置 Token"
+            _init_color = "red"
+
+        api_mode_lbl = ttk.Label(
+            api_status_frame, text=_init_status, foreground=_init_color,
+        )
+        api_mode_lbl.pack(side="left")
+
+        ttk.Label(lf_api, text="API Token").grid(
+            row=1, column=0, sticky="w", padx=5, pady=3)
+        e_api_token = ttk.Entry(lf_api, width=50, show="*")
+        e_api_token.insert(0, cur_token)
+        e_api_token.grid(row=1, column=1, padx=5, pady=3)
+
+        ttk.Label(lf_api, text="API 地址").grid(
+            row=2, column=0, sticky="w", padx=5, pady=3)
+        e_api_base = ttk.Entry(lf_api, width=50)
+        e_api_base.insert(
+            0, cfg.get("douyin_api", {}).get(
+                "base_url", "https://api.tikhub.io"))
+        e_api_base.grid(row=2, column=1, padx=5, pady=3)
+
+        def _refresh_token_status():
+            t = e_api_token.get().strip()
+            if _is_trial_token(t):
+                api_mode_lbl.config(
+                    text="当前状态: 试用 Token（额度有限，建议注册自己的账号）",
+                    foreground="orange")
+            elif t:
+                api_mode_lbl.config(
+                    text="当前状态: 个人 Token",
+                    foreground="green")
+            else:
+                api_mode_lbl.config(
+                    text="当前状态: 未配置 Token",
+                    foreground="red")
+
+        def _use_trial_token():
+            e_api_token.delete(0, "end")
+            e_api_token.insert(0, TRIAL_API_TOKEN)
+            e_api_base.delete(0, "end")
+            e_api_base.insert(0, "https://api.tikhub.io")
+            _refresh_token_status()
+
+        def test_douyin_api():
+            token = e_api_token.get().strip()
+            base = e_api_base.get().strip()
+            city = e_city.get().strip() or "北京"
+            if not token:
+                messagebox.showwarning("提示", "请先填写 API Token",
+                                       parent=win)
+                return
+            api_test_lbl.config(text="测试中...", foreground="orange")
+
+            def do():
+                from .crawlers.douyin_api import test_api_connection
+                ok, msg = run_async(test_api_connection(
+                    token, city, base))
+                self.after(0, lambda: (
+                    api_test_lbl.config(
+                        text=("测试成功" if ok else "测试失败"),
+                        foreground=("green" if ok else "red")),
+                    messagebox.showinfo(
+                        "测试结果", msg, parent=win),
+                ))
+            threading.Thread(target=do, daemon=True).start()
+
+        api_btn_row = ttk.Frame(lf_api)
+        api_btn_row.grid(row=3, column=0, columnspan=2, pady=5)
+        ttk.Button(api_btn_row, text="测试 API",
+                   command=test_douyin_api).pack(side="left", padx=5)
+        ttk.Button(api_btn_row, text="恢复试用 Token",
+                   command=_use_trial_token).pack(side="left", padx=5)
+        ttk.Button(api_btn_row, text="注册指南",
+                   command=lambda: self._show_api_guide(win)).pack(
+                       side="left", padx=5)
+        api_test_lbl = ttk.Label(api_btn_row, text="", foreground="gray")
+        api_test_lbl.pack(side="left", padx=5)
+
+        ttk.Label(lf_api,
+                  text="注册: user.tikhub.io（每日签到获免费额度）"
+                       " | 国内用户API地址改为 api.tikhub.dev",
+                  foreground="blue").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
 
         # --- 大模型 ---
         lf1 = ttk.LabelFrame(win, text="大模型 API（语义判断）")
@@ -675,11 +786,152 @@ class MainApp(tk.Frame):
             cfg["dingtalk"] = {"webhook_url": e_ding.get().strip()}
             cfg["wechat"] = {"webhook_url": e_wx.get().strip()}
             cfg["crawler"] = {"target_city": e_city.get().strip()}
+            cfg["douyin_api"] = {
+                "token": e_api_token.get().strip(),
+                "base_url": (e_api_base.get().strip()
+                             or "https://api.tikhub.io"),
+            }
             save_config(cfg)
             messagebox.showinfo("成功", "设置已保存")
             win.destroy()
 
         ttk.Button(win, text="保存设置", command=do_save).pack(pady=10)
+
+    def _show_api_guide(self, parent):
+        """Show a scrollable step-by-step guide for TikHub registration."""
+        guide = tk.Toplevel(parent)
+        guide.title("抖音同城 API — 注册与配置指南")
+        guide.geometry("620x720")
+        guide.transient(parent)
+
+        canvas = tk.Canvas(guide)
+        scrollbar = ttk.Scrollbar(guide, orient="vertical",
+                                  command=canvas.yview)
+        inner = ttk.Frame(canvas)
+
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _add_heading(text, row):
+            lbl = ttk.Label(inner, text=text,
+                            font=("", 13, "bold"))
+            lbl.grid(row=row, column=0, columnspan=2,
+                     sticky="w", padx=12, pady=(14, 4))
+
+        def _add_text(text, row, *, fg="black", indent=False):
+            lbl = ttk.Label(inner, text=text, wraplength=560,
+                            foreground=fg, justify="left")
+            px = 30 if indent else 12
+            lbl.grid(row=row, column=0, columnspan=2,
+                     sticky="w", padx=px, pady=2)
+
+        def _add_link(text, url, row):
+            lbl = ttk.Label(inner, text=text, foreground="blue",
+                            cursor="hand2", font=("", 11, "underline"))
+            lbl.grid(row=row, column=0, columnspan=2,
+                     sticky="w", padx=30, pady=2)
+            lbl.bind("<Button-1>",
+                     lambda e: __import__("webbrowser").open(url))
+
+        r = 0
+        _add_heading("关于试用 Token", r); r += 1
+        _add_text(
+            "本工具已内置一个试用 Token，可直接使用抖音同城采集功能。"
+            "\n试用 Token 的额度有限且为共享资源，建议尽快注册自己的"
+            " TikHub 账号并替换为个人 Token。", r); r += 1
+        _add_text(
+            "注册完全免费，每日签到可获得免费调用额度，日常使用完全够用。",
+            r, fg="green"); r += 1
+
+        _add_heading("第 1 步：注册 TikHub 账号", r); r += 1
+        _add_text("打开 TikHub 注册页面，使用邮箱注册：", r); r += 1
+        _add_link("https://user.tikhub.io/users/signin",
+                  "https://user.tikhub.io/users/signin", r); r += 1
+        _add_text('点击页面下方 "Sign up now" 链接，填写邮箱和密码完成注册。',
+                  r, indent=True); r += 1
+
+        _add_heading("第 2 步：验证邮箱", r); r += 1
+        _add_text(
+            "注册后会收到一封验证邮件，点击邮件中的链接完成验证。"
+            "\n如未收到，检查垃圾箱或重新发送验证邮件。",
+            r, indent=True); r += 1
+
+        _add_heading("第 3 步：每日签到领取免费额度", r); r += 1
+        _add_text(
+            "登录后，点击页面右上角的 \"Check-in\" 签到按钮。"
+            "\n每天签到可获得免费 API 调用额度，养成签到习惯即可长期免费使用。",
+            r, indent=True); r += 1
+
+        _add_heading("第 4 步：创建 API Token", r); r += 1
+        _add_text("登录后进入 API Key 管理页面：", r); r += 1
+        _add_link("https://user.tikhub.io/users/api_keys",
+                  "https://user.tikhub.io/users/api_keys", r); r += 1
+        _add_text(
+            '点击 "Create API Key"，填写名称（如 "my-crawler"），'
+            "勾选所有 Scopes 权限，然后点击创建。",
+            r, indent=True); r += 1
+        _add_text(
+            "★ 重要：Token 创建后只显示一次！请立即复制保存！",
+            r, fg="red", indent=True); r += 1
+
+        _add_heading("第 5 步：在本工具中配置", r); r += 1
+        _add_text(
+            "回到本工具「设置」页面 →「抖音同城 API」区域：\n"
+            "1. 将复制的 Token 粘贴到「API Token」输入框\n"
+            "2. API 地址保持默认 https://api.tikhub.io\n"
+            "   ★ 国内用户请改为 https://api.tikhub.dev（无需VPN）\n"
+            "3. 点击「测试 API」确认显示「测试成功」\n"
+            "4. 点击「保存设置」",
+            r, indent=True); r += 1
+
+        _add_heading("第 6 步：开始采集", r); r += 1
+        _add_text(
+            "回到主页，填写目标城市，点击「开始采集」。"
+            "\n状态栏会显示 \"★ 方案0: 调用真实同城API...\" 表示正在使用 API 采集。",
+            r, indent=True); r += 1
+
+        _add_heading("关于额度与充值", r); r += 1
+        _add_text(
+            "· 每日签到：免费获取调用额度，日常采集完全够用\n"
+            "· 额度查看：登录 TikHub 后在仪表盘可查看剩余额度\n"
+            "· 充值（可选）：如需大量采集，可在 TikHub 平台购买额度包",
+            r, indent=True); r += 1
+        _add_link("https://user.tikhub.io/users/token_usage",
+                  "https://user.tikhub.io/users/token_usage", r); r += 1
+
+        _add_heading("国内用户特别说明", r); r += 1
+        _add_text(
+            "如果无法访问 api.tikhub.io，请将 API 地址改为：\n"
+            "https://api.tikhub.dev\n"
+            "该域名可直接在国内访问，无需任何代理工具。",
+            r, fg="blue", indent=True); r += 1
+
+        _add_heading("常见问题", r); r += 1
+        _add_text(
+            "Q: Token 忘记复制了怎么办？\n"
+            "A: 需要删除旧 Token 并重新创建一个新的。\n\n"
+            "Q: 提示「测试失败」？\n"
+            "A: 检查 Token 是否完整粘贴，以及 API 地址是否正确。\n"
+            "   国内用户务必使用 api.tikhub.dev。\n\n"
+            "Q: 额度用完了？\n"
+            "A: 每天签到可重新获取，或在 TikHub 购买额度包。",
+            r, indent=True); r += 1
+
+        btn_frame = ttk.Frame(inner)
+        btn_frame.grid(row=r, column=0, columnspan=2, pady=15)
+        ttk.Button(
+            btn_frame, text="打开 TikHub 注册页面",
+            command=lambda: __import__("webbrowser").open(
+                "https://user.tikhub.io/users/signin")
+        ).pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="关闭",
+                   command=guide.destroy).pack(side="left", padx=8)
 
     def _login_platform(self, platform, status_label, parent_win):
         """Open a visible browser for the user to log in to *platform*."""
@@ -747,10 +999,13 @@ class MainApp(tk.Frame):
         def _status_cb(msg):
             self.after(0, lambda m=msg: self._on_strategy_status(m))
 
+        douyin_api_cfg = cfg.get("douyin_api", {})
+
         self.crawler_manager = CrawlerManager(
             DB_PATH, platforms, DATA_DIR,
             target_city=target_city,
-            status_callback=_status_cb)
+            status_callback=_status_cb,
+            douyin_api_config=douyin_api_cfg)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.lbl_status.config(text="采集启动中...")

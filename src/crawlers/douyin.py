@@ -1,19 +1,10 @@
 """
-抖音爬虫 — 同城话题搜索采集
+抖音爬虫 — 同城热点 API + 话题搜索兜底
 
-抖音网页版（桌面端）没有「同城」标签页，该功能仅存在于手机 App。
-但抖音创作者会主动为本地内容打上 #城市同城 等话题标签，这些视频
-与 App 同城页展示的内容高度重合。
-
-采集策略：
-  1. 搜索「{城市}同城」话题 — 获取创作者为本地受众标记的视频
-  2. 搜索「{城市}生活」— 补充本地生活类内容
-  3. 辅以 GPS 地理位置伪装 — 尽可能影响推荐算法
-  4. 会话缓存 — 验证码只需过一次，后续自动复用 Cookie
-
-策略级联：
-  方案1: 优先使用「设置」里登录的无头会话搜索话题（与登录同源 Cookie）；
-         若无数据且已知城市坐标，再尝试独立 GPS 上下文。
+采集策略（按优先级）：
+  ★ 方案0 (API): 调用 TikHub 同城热点榜接口，获取抖音按城市推荐
+        的热门视频内容。需在「设置」中填入 TikHub API Token。
+  方案1: 使用「设置」里登录的无头会话搜索城市话题（Cookie 复用）。
   方案2: 有头移动端 + 手动过验证码，并写回 Cookie。
   兜底:  主页推荐流（非同城，仅作样本）
 """
@@ -272,6 +263,7 @@ class DouyinCrawler(BaseCrawler):
 
     def __init__(self, browser_manager=None):
         super().__init__(browser_manager)
+        self.api_config: dict = {}
 
     async def cleanup_session(self):
         """No long-lived context to hold (search uses short-lived pages)."""
@@ -319,14 +311,37 @@ class DouyinCrawler(BaseCrawler):
 
         coords = _get_city_coords(city)
 
+        # ── ★ 方案0: 真实同城 API（优先） ──
+        api_token = self.api_config.get("token", "").strip()
+        if api_token:
+            self._notify("[抖音] ★ 方案0: 调用真实同城API...")
+            try:
+                results = await self._strategy_api(city, api_token)
+                if results:
+                    self._notify(
+                        f"[抖音] ★ 同城API成功！获取 {len(results)} 条"
+                        "真实同城视频（与App同城频道一致）")
+                    return results
+                self._notify(
+                    "[抖音] 同城API未返回数据（额度不足或网络问题），"
+                    "将尝试浏览器方案...")
+            except Exception as exc:
+                logger.warning("[抖音] API strategy error: %s", exc)
+                self._notify(
+                    f"[抖音] 同城API出错: {exc}，将尝试浏览器方案...")
+        else:
+            self._notify(
+                "[抖音] 未配置同城API Token，跳过API方案。"
+                "（在「设置」中填入 TikHub Token 可获取真实同城数据）")
+
+        # ── 浏览器方案兜底 ──
         if not self.bm.has_cookies(self.platform_name):
             self._notify(
                 "[抖音] 未检测到有效登录 Cookie，搜索大概率无结果；"
                 "请先在「设置」中登录抖音后再采集")
 
-        # ── 复用与「设置」登录相同的浏览器上下文（Cookie 已注入）──
         try:
-            self._notify("[抖音] 复用已登录会话，尝试同城搜索...")
+            self._notify("[抖音] 方案1: 复用已登录会话搜索城市话题...")
             page = await self.bm.create_stealth_page(self.platform_name)
             try:
                 try:
@@ -339,8 +354,8 @@ class DouyinCrawler(BaseCrawler):
                 await human_delay(2.0, 4.0)
                 if await self._ssr_user_anonymous(page):
                     self._notify(
-                        "[抖音] 首页判定未登录，跳过无头批量搜索。"
-                        "同城采集将走方案2：请留意即将弹出的浏览器并完成验证（通常只需一次）。")
+                        "[抖音] 方案1：首页判定未登录，跳过。"
+                        "将尝试方案2（弹窗浏览器手动验证）...")
                     results = []
                 else:
                     results = await self._search_city_content(
@@ -348,7 +363,7 @@ class DouyinCrawler(BaseCrawler):
                 if results:
                     await self.bm.save_cookies(self.platform_name)
                     self._notify(
-                        f"[抖音] 复用会话成功！获取 {len(results)} 条同城内容")
+                        f"[抖音] 方案1成功！获取 {len(results)} 条城市话题内容")
                     return results
             finally:
                 try:
@@ -358,11 +373,10 @@ class DouyinCrawler(BaseCrawler):
         except Exception as exc:
             logger.warning("[抖音] Session reuse error: %s", exc)
 
-        # ── Cascade strategies ──
         strategies = [
-            ("方案1: 同城内容采集(自动)",
+            ("方案1b: 城市话题搜索(GPS伪装)",
              lambda: self._strategy_search_headless(city, coords)),
-            ("方案2: 同城内容采集(手动验证)",
+            ("方案2: 城市话题搜索(手动验证)",
              lambda: self._strategy_search_headed(city, coords)),
         ]
 
@@ -372,7 +386,7 @@ class DouyinCrawler(BaseCrawler):
                 results = await fn()
                 if results:
                     self._notify(
-                        f"[抖音] {name} 成功！获取 {len(results)} 条同城内容")
+                        f"[抖音] {name} 成功！获取 {len(results)} 条城市话题内容")
                     return results
                 self._notify(
                     f"[抖音] {name} 未获取到数据，准备尝试下一方案")
@@ -384,6 +398,21 @@ class DouyinCrawler(BaseCrawler):
         self._notify(
             "[抖音] 同城方案均未成功，改用主页推荐流兜底（非同城，仅作样本）")
         return await self._strategy_main_feed()
+
+    # ═══════════════════════════════════════════════════
+    #  S0: Real 同城 API (TikHub)
+    # ═══════════════════════════════════════════════════
+
+    async def _strategy_api(self, city: str, token: str
+                            ) -> list[CrawlResult]:
+        """Call TikHub city hot-list for real 同城 feed."""
+        from .douyin_api import fetch_nearby_videos
+        api_base = self.api_config.get(
+            "base_url", "").strip() or None
+        kwargs = {"token": token, "city": city, "notify": self._notify}
+        if api_base:
+            kwargs["api_base"] = api_base
+        return await fetch_nearby_videos(**kwargs)
 
     # ═══════════════════════════════════════════════════
     #  S1: Search headless (automatic)

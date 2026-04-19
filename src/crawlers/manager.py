@@ -29,11 +29,13 @@ class CrawlerManager:
     def __init__(self, db_path: Path, platforms: list[str],
                  data_dir=None, *,
                  target_city: str = "",
-                 status_callback=None):
+                 status_callback=None,
+                 douyin_api_config: dict | None = None):
         self.db_path = db_path
         self.platforms = [p for p in platforms if p in CRAWLERS]
         self.target_city = target_city
         self.status_callback = status_callback
+        self.douyin_api_config = douyin_api_config or {}
         self._running = False
 
         if data_dir is None:
@@ -54,6 +56,8 @@ class CrawlerManager:
                 crawler = CRAWLERS[name](self.bm)
                 crawler.target_city = self.target_city
                 crawler.status_callback = self.status_callback
+                if name == "抖音" and self.douyin_api_config:
+                    crawler.api_config = self.douyin_api_config
                 self._crawlers[name] = crawler
 
     async def _run_platform(self, name: str) -> tuple[str, int, int]:
