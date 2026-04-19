@@ -1,13 +1,15 @@
 """
-微信视频号爬虫 — 级联反检测策略
+微信视频号爬虫 — API优先 + 级联反检测策略
 
 Data collection strategy with cascading approaches:
+  ★ S0. TikHub API search (city keywords — requires paid balance)
   S1. Standard stealth page → try 同城 tab
   S2. Persistent profile → accumulated login state
   S3. Main feed fallback → whatever is available
 
 NOTE: WeChat Channels has the most restrictive web access and typically
-requires QR-code login. This crawler may return fewer results than others.
+requires QR-code login. The API approach (S0) bypasses all of this but
+requires TikHub paid balance ($0.01/request).
 """
 import asyncio
 import json
@@ -24,10 +26,40 @@ CHANNELS_URL = "https://channels.weixin.qq.com"
 class WechatCrawler(BaseCrawler):
     platform_name = "微信视频号"
 
+    def __init__(self, browser_manager=None):
+        super().__init__(browser_manager)
+        self.api_config: dict = {}
+
     async def fetch_tongcheng(self) -> list[CrawlResult]:
         if not self.bm:
             return []
 
+        city = self.target_city
+
+        # ── ★ 方案0: TikHub API 搜索（优先） ──
+        api_token = self.api_config.get("token", "").strip()
+        if api_token and city:
+            self._notify("[微信视频号] ★ 方案0: 调用视频号搜索API...")
+            try:
+                results = await self._strategy_api(city, api_token)
+                if results:
+                    self._notify(
+                        f"[微信视频号] ★ API搜索成功！获取 {len(results)} 条"
+                        "城市相关视频号内容")
+                    return results
+                self._notify(
+                    "[微信视频号] API未返回数据（可能需要付费余额），"
+                    "将尝试浏览器方案...")
+            except Exception as exc:
+                logger.warning("[微信视频号] API strategy error: %s", exc)
+                self._notify(
+                    f"[微信视频号] API出错: {exc}，将尝试浏览器方案...")
+        elif not api_token:
+            self._notify(
+                "[微信视频号] 未配置API Token，跳过API方案。"
+                "（在「设置」中填入 TikHub Token 并充值可使用视频号API采集）")
+
+        # ── 浏览器方案兜底 ──
         strategies = [
             ("方案1: 隐身模式", self._strategy_stealth),
             ("方案2: 持久化浏览器", self._strategy_persistent),
@@ -51,6 +83,21 @@ class WechatCrawler(BaseCrawler):
 
         self._notify("[微信视频号] 所有方案已尝试完毕，本轮未获取到数据")
         return []
+
+    # ═══════════════════════════════════════════════════
+    #  S0: TikHub API search
+    # ═══════════════════════════════════════════════════
+
+    async def _strategy_api(self, city: str, token: str
+                            ) -> list[CrawlResult]:
+        """Search WeChat Channels for city content via TikHub API."""
+        from .wechat_api import fetch_wechat_city_videos
+        api_base = self.api_config.get(
+            "base_url", "").strip() or None
+        kwargs = {"token": token, "city": city, "notify": self._notify}
+        if api_base:
+            kwargs["api_base"] = api_base
+        return await fetch_wechat_city_videos(**kwargs)
 
     async def _strategy_stealth(self) -> list[CrawlResult]:
         """Strategy 1: stealth page from existing browser."""

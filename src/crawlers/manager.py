@@ -58,7 +58,7 @@ class CrawlerManager:
                 crawler = CRAWLERS[name](self.bm)
                 crawler.target_city = self.target_city
                 crawler.status_callback = self.status_callback
-                if name == "抖音" and self.douyin_api_config:
+                if name in ("抖音", "微信视频号") and self.douyin_api_config:
                     crawler.api_config = self.douyin_api_config
                 self._crawlers[name] = crawler
 
